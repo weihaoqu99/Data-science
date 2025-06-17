@@ -1,0 +1,104 @@
+import os
+import warnings
+from pathlib import Path
+from typing import Union, List, Optional
+
+import pandas as pd
+from sacrebleu import sentence_bleu, sentence_chrf, corpus_bleu
+from sacrebleu.metrics import CHRF
+import evaluate
+import torch
+
+
+class TranslationEvaluator:
+    """
+    Load data
+    Compute sentence-level BLEU, ChrF, ChrF++, optional BERTScore & COMET
+    Compute macro-average model metrics
+    Write Detailed + Model metrics to Excel
+    Also: sweep generation-time beams & length_penalty on a dev set
+    """
+
+    def __init__(
+        self,
+        output_file: Union[str, Path] = "output_data.xlsx",
+        bert_model: Optional[str] = "microsoft/deberta-xlarge-mnli",
+        comet_model: Optional[str] = None,  # e.g. "Unbabel/wmt22-comet-da"
+    ):
+        os.environ["TRANSFORMERS_CACHE"] = str(Path.home() / ".cache" / "huggingface")
+        warnings.simplefilter("ignore")
+
+        self._data            = None
+        self._detailed_results= None
+        self._model_metrics   = None
+        self._output_file     = Path(output_file)
+
+        # core metrics
+        self._chrf       = CHRF(word_order=2)
+        self._bleu_eval  = evaluate.load("sacrebleu")
+        self._chrf_eval  = evaluate.load("chrf")
+        self._berts      = evaluate.load("bertscore") if bert_model else None
+        self._comet      = (
+            evaluate.load("comet_mt", model_name_or_path=comet_model)
+            if comet_model
+            else None
+        )
+
+    def load_data(self, file_path: Union[str, Path]) -> None:
+        fp = Path(file_path)
+        if fp.suffix == ".csv":
+            self._data = pd.read_csv(fp)
+        elif fp.suffix in (".xls", ".xlsx"):
+            self._data = pd.read_excel(fp)
+        else:
+            raise ValueError(f"Unsupported file type: {fp.suffix}")
+
+    # ... [other methods as before: evaluate, generate_report, etc.] ...
+
+    def find_best_generation_config(
+        self,
+        model: torch.nn.Module,
+        tokenizer,
+        dev_texts: List[str],
+        dev_refs: List[str],
+        device: torch.device,
+        max_length: int = 128,
+        beam_options: List[int] = [4, 8, 12],
+        lp_options:   List[float] = [0.6, 0.8, 1.0, 1.2],
+    ) -> dict:
+        """
+        Sweep over num_beams and length_penalty on (dev_texts, dev_refs),
+        print and return best config + BLEU.
+        """
+        # tokenize once
+        input_ids = tokenizer(
+            dev_texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length
+        ).input_ids.to(device)
+
+        best_bleu = -1.0
+        best_cfg  = {}
+
+        for num_beams in beam_options:
+            for length_penalty in lp_options:
+                outs = model.generate(
+                    input_ids       = input_ids,
+                    num_beams       = num_beams,
+                    length_penalty  = length_penalty,
+                    max_new_tokens  = max_length
+                )
+                preds = tokenizer.batch_decode(outs, skip_special_tokens=True)
+                score = corpus_bleu(preds, [dev_refs]).score
+
+                if score > best_bleu:
+                    best_bleu = score
+                    best_cfg  = {
+                        "num_beams":      num_beams,
+                        "length_penalty": length_penalty
+                    }
+
+        print(f"▶ Best generation config: {best_cfg}  → BLEU: {round(best_bleu,2)}")
+        return {"best_cfg": best_cfg, "best_bleu": best_bleu}
