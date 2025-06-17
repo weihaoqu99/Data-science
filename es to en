@@ -1,0 +1,113 @@
+import os
+import torch
+import traceback
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from transformers import T5ForConditionalGeneration, T5Tokenizer
+
+# ← NEW: for language detection
+from langdetect import detect, LangDetectException
+
+# ----------------------------------------------------------------------------
+# 1. DEVICE and MODEL PATHS
+# ----------------------------------------------------------------------------
+
+os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+
+# LoRA adapter directory
+LORA_ADAPTER_PATH = os.getenv(
+    "LORA_PATH",
+    "/app/cortex/dev1/aptaiModels/madlad_merged_LORA_8_v6"
+)
+
+# ----------------------------------------------------------------------------
+# 2. LOAD TOKENIZER
+# ----------------------------------------------------------------------------
+try:
+    tokenizer = T5Tokenizer.from_pretrained(LORA_ADAPTER_PATH)
+    base_model = T5ForConditionalGeneration.from_pretrained(LORA_ADAPTER_PATH)
+    #base_model.to('cuda')
+    base_model.eval()
+except Exception as e:
+    raise RuntimeError(
+        f"Error loading base model/tokenizer from '{LORA_ADAPTER_PATH}': {e}"
+    )
+
+# ----------------------------------------------------------------------------
+# 4. FASTAPI SETUP
+# ----------------------------------------------------------------------------
+app = FastAPI(
+    title="Spanish→English Translation",
+    description="Translate Spanish text into English using a LoRA-fine-tuned Madlad400 T5 model",
+    version="1.0.0"
+)
+
+class TranslateRequest(BaseModel):
+    spanish: str
+    source: str    # ← NEW: must be "es"
+    target: str    # ← NEW: must be "en"
+
+class TranslateResponse(BaseModel):
+    english: str
+
+# ----------------------------------------------------------------------------
+# 5. HEALTH-CHECK ENDPOINT
+# ----------------------------------------------------------------------------
+@app.get("/")
+async def health_check():
+    return {
+        "status": "healthy" if (tokenizer and base_model) else "failed",
+        "device": "cuda",
+        "lora_adapter": LORA_ADAPTER_PATH
+    }
+
+# ----------------------------------------------------------------------------
+# 6. TRANSLATION ENDPOINT
+# ----------------------------------------------------------------------------
+@app.post("/translate/", response_model=TranslateResponse)
+async def translate(request: TranslateRequest):
+    text = request.spanish.strip()
+    if not text:
+        raise HTTPException(400, "Input Spanish text must be non-empty")
+
+    # ← NEW: enforce source/target
+    if request.source.lower() != "es" or request.target.lower() != "en":
+        raise HTTPException(
+            400,
+            "Only Spanish-to-English supported: source must be 'es' and target must be 'en'"
+        )
+
+    # ← NEW: quick language check
+    try:
+        lang = detect(text)
+    except LangDetectException:
+        raise HTTPException(400, "Could not detect input language")
+    if lang != "es":
+        raise HTTPException(400, "Input text is not Spanish")
+
+    # T5 prefix must match what you used during fine-tuning
+    prompt = "translate Spanish to English: " + text
+
+    try:
+        text_prefix = "<2en> "
+        text = text_prefix + text
+        input_ids = tokenizer(text, return_tensors="pt").input_ids.to(base_model.device)
+        outputs = base_model.generate(input_ids=input_ids)
+        return {"english": tokenizer.decode(outputs[0], skip_special_tokens=True)}
+    except Exception as e:
+        tb = traceback.format_exc()
+        # (Optionally log tb somewhere)
+        raise HTTPException(500, f"Translation failed: {e}")
+
+# ----------------------------------------------------------------------------
+# 7. RUN WITH UVICORN
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "translation_app:app",
+        host="0.0.0.0",
+        port=8100,
+        reload=True
+    )
