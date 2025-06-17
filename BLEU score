@@ -147,3 +147,36 @@ class TranslationEvaluator:
 
     def get_model_metrics(self):
         return self._model_metrics.copy()
+
+
+
+
+
+
+# 1) Instantiate evaluator and load your data
+evaluator = TranslationEvaluator()
+evaluator.load_data("your_dev_file.xlsx")
+dev_texts = evaluator._data["es"].tolist()
+dev_refs  = evaluator._data["en"].tolist()
+
+# 2) Find best generation config
+result = evaluator.find_best_generation_config(
+    model      = your_finetuned_model,
+    tokenizer  = your_tokenizer,
+    dev_texts  = dev_texts,
+    dev_refs   = dev_refs,
+    device     = torch.device("cuda"),
+    max_length = 128
+)
+# result == {"best_cfg": {"num_beams":8, "length_penalty":0.8}, "best_bleu": 42.17}
+
+
+
+
+if score > best_bleu:
+    best_bleu = score
+    best_cfg  = {"num_beams": num_beams, "length_penalty": length_penalty}
+
+print("▶ Best generation config:", best_cfg, "→ BLEU:", best_bleu)
+
+
