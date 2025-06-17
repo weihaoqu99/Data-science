@@ -1,0 +1,149 @@
+import pandas as pd
+from sacrebleu import sentence_bleu, sentence_chrf
+from sacrebleu.metrics import CHRF
+from pathlib import Path
+from typing import Union, List, Optional
+import warnings, os
+
+class TranslationEvaluator:
+    """
+    Load data
+    Compute sentence-level BLEU, ChrF, ChrF++
+    Compute macro-average model metrics
+    Write Detailed + Model metrics to Excel
+    """
+
+    def __init__(self, output_file: Union[str, Path] = "output_data.xlsx"):
+        # optional cache setting for COMET/BERTScore later
+        os.environ["TRANSFORMERS_CACHE"] = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+        warnings.simplefilter("ignore")
+
+        self._data = None
+        self._detailed_results = None
+        self._model_metrics = None
+        self._output_file = Path(output_file)
+        self._chrf = CHRF(word_order=2)
+
+    def load_data(self, file_path: Union[str, Path]) -> None:
+        fp = Path(file_path)
+        if fp.suffix == ".csv":
+            self._data = pd.read_csv(fp)
+        elif fp.suffix in (".xls", ".xlsx"):
+            self._data = pd.read_excel(fp)
+        else:
+            raise ValueError(f"Unsupported file type: {fp.suffix}")
+
+    def evaluate(
+        self,
+        prediction_cols: List[str] = ["candidate"],
+        reference_col: str = "reference",
+        metrics: List[str] = ["BLEU", "ChrF", "ChrF++"],
+        keep_cols: Optional[List[str]] = None
+    ) -> None:
+        if self._data is None:
+            raise ValueError("No data loaded. Call load_data() first.")
+        keep = keep_cols or []
+        if reference_col not in keep:
+            keep.insert(0, reference_col)
+
+        self._validate_columns(reference_col, prediction_cols, keep)
+        self._compute_detailed_metrics(reference_col, prediction_cols, metrics, keep)
+        self._compute_model_metrics(metrics, prediction_cols)
+
+    def _validate_columns(
+        self,
+        reference_col: str,
+        prediction_cols: List[str],
+        keep_cols: List[str]
+    ) -> None:
+        missing = [c for c in [reference_col] + prediction_cols + keep_cols if c not in self._data.columns]
+        if missing:
+            raise ValueError(f"Columns not found in data: {missing}")
+
+    def _compute_detailed_metrics(
+        self,
+        reference_col: str,
+        prediction_cols: List[str],
+        metrics: List[str],
+        keep_cols: List[str]
+    ) -> None:
+        df = self._data.copy()
+        for p in prediction_cols:
+            if "BLEU" in metrics:
+                df[f"{p} BLEU"] = df.apply(
+                    lambda r: sentence_bleu(r[p], [r[reference_col]]).score,
+                    axis=1
+                )
+            if "ChrF" in metrics:
+                df[f"{p} ChrF"] = df.apply(
+                    lambda r: sentence_chrf(r[p], [r[reference_col]]).score,
+                    axis=1
+                )
+            if "ChrF++" in metrics:
+                df[f"{p} ChrF++"] = df.apply(
+                    lambda r: self._chrf.sentence_score(r[p], [r[reference_col]]).score,
+                    axis=1
+                )
+
+        cols = keep_cols.copy()
+        for p in prediction_cols:
+            cols.append(p)
+            for m in ["BLEU", "ChrF", "ChrF++"]:
+                if m in metrics:
+                    cols.append(f"{p} {m}")
+
+        self._detailed_results = df[cols]
+
+    def _compute_model_metrics(
+        self,
+        metrics: List[str],
+        prediction_cols: List[str]
+    ) -> None:
+        rows = []
+        for p in prediction_cols:
+            row = {"Model": p}
+            for m in ["BLEU", "ChrF", "ChrF++"]:
+                if m in metrics:
+                    col_name = f"{p} {m}"
+                    row[m] = self._detailed_results[col_name].mean()
+            rows.append(row)
+        self._model_metrics = pd.DataFrame(rows)
+
+    def generate_report(self) -> None:
+        """
+        Public method: write Detailed + Model metrics (macro-avg) to Excel,
+        and print out the full path so you know where it went.
+        """
+        self._output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with pd.ExcelWriter(self._output_file, engine="xlsxwriter") as writer:
+            # 1) detailed per-sentence
+            self._detailed_results.to_excel(writer, sheet_name="Detailed metrics", index=False)
+            # 2) macro-avg summary
+            self._model_metrics.to_excel(writer, sheet_name="Model metrics", index=False)
+
+            # format Model metrics sheet
+            wb = writer.book
+            ws = writer.sheets["Model metrics"]
+            max_row, max_col = self._model_metrics.shape
+            headers = [{"header": c} for c in self._model_metrics.columns]
+            ws.add_table(0, 0, max_row, max_col - 1, {
+                "columns": headers,
+                "style": "Table Style Medium 9",
+                "name": "ModelMetrics"
+            })
+
+            for idx, col in enumerate(self._model_metrics.columns):
+                width = max(
+                    self._model_metrics[col].astype(str).map(len).max(),
+                    len(col)
+                ) + 2
+                ws.set_column(idx, idx, width)
+
+        print(f"Report saved to: {self._output_file.resolve()}")
+
+    def get_detailed_results(self):
+        return self._detailed_results.copy()
+
+    def get_model_metrics(self):
+        return self._model_metrics.copy()
