@@ -1,100 +1,151 @@
 #!/usr/bin/env python3
 import os
 import sys
-import argparse
-from pathlib import Path
 import warnings
-
+from pathlib import Path
 import pandas as pd
+import numpy as np
 import evaluate
-import torch
 
-def main(input_files, output_dir):
-    # 1) sanity checks
-    if not input_files:
-        print("❌ Error: no input files provided. Pass at least one .xlsx/.xls file.")
-        sys.exit(1)
-    os.makedirs(output_dir, exist_ok=True)
+class BertScoreEvaluator:
+    """
+    Load data, compute sentence‐level BERTScore (P/R/F1), write
+    both detailed and macro‐average results to Excel.
+    """
+    def __init__(
+        self,
+        output_file: Path,
+        model_type: str = "roberta-large",
+        num_layers: int = None,
+        device: str = None,
+    ):
+        # allow user to override where HF cache lives
+        # e.g. os.environ["TRANSFORMERS_CACHE"] = "/path/to/cache"
+        warnings.simplefilter("ignore", UserWarning)
 
-    # 2) load the BERTScore metric
-    warnings.simplefilter("ignore")
-    scorer = evaluate.load("bertscore")  # will pick up your local bertscore.py if you overrode
-    print("✅ Loaded local BERTScore metric")
+        self.scorer = evaluate.load("bertscore")
+        self._data = None
+        self._detailed = None
+        self._summary = None
 
-    # 3) for each input file, compute scores and write a combined Excel
-    for fp in input_files:
-        fp = Path(fp)
-        print(f"🔄 Processing {fp}…")
-        # read in
-        try:
-            df = pd.read_excel(fp)
-        except Exception as e:
-            print(f"❌ Could not read Excel {fp}: {e}")
-            sys.exit(1)
+        self.output_file = Path(output_file)
+        self.model_type = model_type
+        self.num_layers = num_layers
+        self.device = device or ("cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu")
 
-        # require columns
-        for col in ("reference", "candidate"):
-            if col not in df.columns:
-                print(f"❌ Excel {fp} must have a '{col}' column")
-                sys.exit(1)
+    def load_data(self, file_path: Path):
+        file_path = Path(file_path)
+        if file_path.suffix.lower() == ".csv":
+            self._data = pd.read_csv(file_path)
+        elif file_path.suffix.lower() in {".xls", ".xlsx"}:
+            self._data = pd.read_excel(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {file_path.suffix!r}")
 
-        # prepare lists
-        refs  = df["reference"].astype(str).str.strip().tolist()
-        cands = df["candidate"].astype(str).str.strip().tolist()
+    def evaluate(self, prediction_col="candidate", reference_col="reference"):
+        if self._data is None:
+            raise ValueError("No data loaded. Call load_data() first.")
 
-        # compute
-        try:
-            out = scorer.compute(
-                predictions=cands,
-                references=refs,
-                model_type="roberta-large",                       # ← important
-                num_layers=17,
-                device="cuda" if torch.cuda.is_available() else "cpu",
-                rescale_with_baseline=True,
-                baseline_path=str(Path(__file__).parent / "roberta-large.tsv"),
-                lang="en",
+        df = self._data.copy()
+        # ensure strings
+        preds = df[prediction_col].astype(str).tolist()
+        refs  = df[reference_col].astype(str).tolist()
+
+        # compute batched BERTScore
+        res = self.scorer.compute(
+            predictions=preds,
+            references=refs,
+            model_type=self.model_type,
+            num_layers=self.num_layers,
+            device=self.device,
+            lang="en",
+        )
+
+        # attach to df
+        df["precision"] = res["precision"]
+        df["recall"]    = res["recall"]
+        df["f1"]        = res["f1"]
+
+        # store detailed + summary
+        self._detailed = df[[reference_col, prediction_col, "precision","recall","f1"]]
+        mean_p = np.mean(res["precision"])
+        mean_r = np.mean(res["recall"])
+        mean_f = np.mean(res["f1"])
+        self._summary = pd.DataFrame([{
+            "Model":          self.model_type,
+            "Precision_mean": mean_p,
+            "Recall_mean":    mean_r,
+            "F1_mean":        mean_f,
+        }])
+
+    def generate_report(self):
+        # ensure parent exists
+        self.output_file.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(self.output_file, engine="xlsxwriter") as writer:
+            # 1) detailed per‐sentence
+            self._detailed.to_excel(
+                writer, sheet_name="Detailed metrics", index=False
             )
-        except Exception as e:
-            print("❌ BERTScore compute failed:", e)
-            sys.exit(1)
-
-        # unpack into dataframe
-        df["precision"] = out["precision"]
-        df["recall"]    = out["recall"]
-        df["f1"]        = out["f1"]
-
-        # macro‐average
-        model_metrics = {
-            "Model": "roberta-large",
-            "Precision": sum(df["precision"]) / len(df["precision"]),
-            "Recall":    sum(df["recall"])    / len(df["recall"]),
-            "F1":        sum(df["f1"])        / len(df["f1"]),
-        }
-
-        # write to Excel
-        report_path = Path(output_dir) / "Bertscore_output.xlsx"
-        with pd.ExcelWriter(report_path, engine="xlsxwriter") as writer:
-            df.to_excel(writer, sheet_name="Detailed_metrics", index=False)
-            pd.DataFrame([model_metrics]).to_excel(
-                writer, sheet_name="Model_metrics", index=False
+            # 2) macro‐average summary
+            self._summary.to_excel(
+                writer, sheet_name="Model metrics", index=False
             )
+        print(f"✅ Report saved to: {self.output_file.resolve()}")
 
-        print(f"✅ Report saved to {report_path.resolve()}")
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Run BERTScore Metric Calculator"
-    )
-    parser.add_argument(
-        "--output_dir", type=str, required=True,
-        help="Directory where Bertscore_output.xlsx will be saved"
-    )
-    parser.add_argument(
-        "files", nargs="+",
-        help="One or more input Excel files (.xls/.xlsx)"
-    )
-    args = parser.parse_args()
+    import argparse
 
-    print(f"Output directory: {args.output_dir}")
-    print(f"Input files: {args.files}")
-    main(args.files, args.output_dir)
+    p = argparse.ArgumentParser(
+        description="Run BERTScore evaluation on one or more files"
+    )
+    p.add_argument(
+        "--output_dir",
+        type=Path,
+        required=True,
+        help="Directory in which to write the Excel report"
+    )
+    p.add_argument(
+        "--model_type",
+        type=str,
+        default="roberta-large",
+        help="HuggingFace model to use for BERTScore"
+    )
+    p.add_argument(
+        "--num_layers",
+        type=int,
+        default=None,
+        help="How many transformer layers to use (default: all)"
+    )
+    p.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device for scoring (cuda or cpu)"
+    )
+    p.add_argument(
+        "files",
+        nargs="+",
+        help="One or more input CSV/XLS/XLSX files"
+    )
+    args = p.parse_args()
+
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / "Bertscore_output.xlsx"
+
+    evaluator = BertScoreEvaluator(
+        output_file=output_path,
+        model_type=args.model_type,
+        num_layers=args.num_layers,
+        device=args.device,
+    )
+
+    for f in args.files:
+        print(f"📥 Loading data from {f}")
+        evaluator.load_data(f)
+
+    print("▶️ Computing BERTScore...")
+    evaluator.evaluate()
+    evaluator.generate_report()
