@@ -7,6 +7,21 @@ from pathlib import Path
 import pandas as pd
 from bert_score import BERTScorer
 
+# ─── Offline HuggingFace setup ─────────────────────────────────────────────────
+# Point at your locally‐cached roberta‐large model and baseline TSV:
+MODEL_PATH    = os.getenv(
+    "BERT",
+    "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large"
+)
+BASELINE_PATH = os.getenv(
+    "BASELINE",
+    "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large/en/roberta-large.tsv"
+)
+# Force transformers into offline mode
+os.environ["TRANSFORMERS_CACHE"]   = MODEL_PATH
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+# ────────────────────────────────────────────────────────────────────────────────
+
 
 class BertScoreEvaluator:
     """
@@ -16,28 +31,30 @@ class BertScoreEvaluator:
     Write Detailed + Model metrics to Excel
     """
     def __init__(self, output_file: Path):
-        # optional: if you want to point at a local HF cache/model dir
-        # os.environ["TRANSFORMERS_CACHE"] = r"/path/to/roberta-large"
         warnings.simplefilter("ignore")
-        self._data = None
+        self._data     = None
         self._detailed = None
-        self._summary = None
-        self._out = Path(output_file)
-        # instantiate a scorer
+        self._summary  = None
+        self._out      = Path(output_file)
+
+        # initialize scorer with local model & baseline
         self._scorer = BERTScorer(
             lang="en",
             rescale_with_baseline=True,
-            model_type="roberta-large"
+            model_type=MODEL_PATH,
+            baseline_path=BASELINE_PATH,
+            device=os.getenv("DEVICE", "cpu"),
         )
 
     def load_data(self, fp: Path):
+        # support .xlsx/.xls and .csv, concatenating multiple files if given
         if fp.suffix in (".xls", ".xlsx"):
             df = pd.read_excel(fp)
         elif fp.suffix == ".csv":
             df = pd.read_csv(fp)
         else:
-            raise ValueError(f"Unsupported file type {fp.suffix}")
-        # if you want to support multiple files, concatenate them:
+            raise ValueError(f"Unsupported file type: {fp.suffix}")
+
         if self._data is None:
             self._data = df
         else:
@@ -51,32 +68,35 @@ class BertScoreEvaluator:
     ):
         if self._data is None:
             raise ValueError("No data loaded—call load_data() first")
+
         keep = keep_cols or []
         if reference_col not in keep:
             keep = [reference_col] + keep
 
-        # validate
+        # validate required columns
         missing = [c for c in [reference_col] + prediction_cols + keep if c not in self._data.columns]
         if missing:
             raise ValueError(f"Columns not found in data: {missing}")
 
         df = self._data.copy().astype(str)
+        # compute per-sentence P, R, F1
         for p in prediction_cols:
             preds = df[p].tolist()
             refs  = [[r] for r in df[reference_col].tolist()]
             P, R, F1 = self._scorer.score(preds, refs)
+
             df[f"{p} BERT-P"]  = P.tolist()
             df[f"{p} BERT-R"]  = R.tolist()
             df[f"{p} BERT-F1"] = F1.tolist()
 
-        # build detailed table
+        # build detailed-results DataFrame
         cols = keep.copy()
         for p in prediction_cols:
             cols.append(p)
             cols += [f"{p} BERT-P", f"{p} BERT-R", f"{p} BERT-F1"]
         self._detailed = df[cols]
 
-        # build macro summary
+        # build macro-average summary DataFrame
         rows = []
         for p in prediction_cols:
             rows.append({
@@ -88,25 +108,25 @@ class BertScoreEvaluator:
         self._summary = pd.DataFrame(rows)
 
     def generate_report(self):
-        # make sure output dir exists
+        # ensure output dir exists
         self._out.parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(self._out, engine="xlsxwriter") as writer:
-            # 1) detailed per-sentence (optional; JSON reads only "Model metrics")
+            # 1) detailed per-sentence (optional; your webapp JSON only reads “Model metrics”)
             self._detailed.to_excel(writer, sheet_name="Detailed metrics", index=False)
-            # 2) macro-avg summary
+            # 2) macro-average summary
             self._summary.to_excel(writer, sheet_name="Model metrics", index=False)
 
-            # format the Model metrics sheet
+            # nice table formatting on summary sheet
             wb = writer.book
             ws = writer.sheets["Model metrics"]
             max_row, max_col = self._summary.shape
             headers = [{"header": c} for c in self._summary.columns]
-            ws.add_table(0, 0, max_row, max_col-1, {
+            ws.add_table(0, 0, max_row, max_col - 1, {
                 "columns": headers,
                 "style": "Table Style Medium 9",
                 "name": "BertScoreSummary"
             })
-            # auto‐fit
+            # auto-fit
             for idx, col in enumerate(self._summary.columns):
                 width = max(
                     self._summary[col].astype(str).map(len).max(),
@@ -132,11 +152,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    out_dir = args.output_dir
+    out_dir    = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_path = out_dir / "Bertscore_output.xlsx"
+    output_fp  = out_dir / "Bertscore_output.xlsx"
 
-    evaluator = BertScoreEvaluator(output_file=output_path)
+    evaluator = BertScoreEvaluator(output_file=output_fp)
     for f in args.files:
         print(f"▶ Loading data from {f}")
         evaluator.load_data(Path(f))
@@ -148,5 +168,4 @@ if __name__ == "__main__":
     )
     evaluator.generate_report()
     print("✅ All done!")
-    
     
