@@ -1,3 +1,12 @@
+...
+"Bertscore": {
+  "script_path": "Automation_Scripts/Bertscore.py",
+  "output_file_to_display_summary": "Bertscore_output.xlsx",
+  "display_results_sheet_name": ["Model metrics"]
+}
+...
+
+
 #!/usr/bin/env python3
 """
 Bertscore.py
