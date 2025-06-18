@@ -1,178 +1,68 @@
-# ────────────────────────────────────────────────────────────────────────────────
-# 1) Imports & Setup
-# ────────────────────────────────────────────────────────────────────────────────
-import os
-import warnings
-import pandas as pd
-import numpy as np
-import torch
-torch.manual_seed(0)
-
-from datasets import Dataset
-from peft import LoraConfig, get_peft_model
-from nltk.translate.bleu_score import sentence_bleu
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from transformers import (
-    T5ForConditionalGeneration,
-    T5Tokenizer,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments,
-    DataCollatorForSeq2Seq,
-    logging,
-)
 import optuna
+from transformers import T5ForConditionalGeneration, Seq2SeqTrainingArguments, Seq2SeqTrainer
 
-# silence warnings
-warnings.filterwarnings("ignore")
-logging.set_verbosity_error()
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 2) Load & Tokenize Data
-# ────────────────────────────────────────────────────────────────────────────────
-def load_and_lowercase(path):
-    df = pd.read_excel(path)
-    return df.applymap(lambda x: x.lower() if isinstance(x, str) else x)
-
-train_df = load_and_lowercase("/appdata/cortex/dev1/shob/refined_datasets/refined_train_df.xlsx")
-val_df   = load_and_lowercase("/appdata/cortex/dev1/shob/refined_datasets/refined_validation_df.xlsx")
-
-train_ds = Dataset.from_pandas(train_df)
-val_ds   = Dataset.from_pandas(val_df)
-
-tokenizer = T5Tokenizer.from_pretrained("/appdata/cortex/dev1/aptaiModels/madlad400-3b-mt")
-max_length = 128
-
-def preprocess(batch):
-    inputs, targets = batch["es"], batch["en"]
-    model_inputs = tokenizer(inputs, text_target=targets,
-                             max_length=max_length, truncation=True)
-    with tokenizer.as_target_tokenizer():
-        labels = tokenizer(targets, max_length=max_length, truncation=True)
-    model_inputs["labels"] = labels["input_ids"]
-    return model_inputs
-
-tokenized_train = train_ds.map(preprocess, batched=True)
-tokenized_val   = val_ds.map(preprocess, batched=True)
-
-data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 3) Base LoRA Config (frozen base)
-# ────────────────────────────────────────────────────────────────────────────────
-BASE_CKPT = "/appdata/cortex/dev1/aptaiModels/madlad400-3b-mt"
-
-lora_config = LoraConfig(
-    use_rslora=True,
-    r=64,
-    lora_alpha=64,
-    target_modules=["q","k","v","o"],
-    lora_dropout=0.1,
-    bias="lora_only",
-    task_type="SEQ_2_SEQ_LM",
-)
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 4) Metric fn (BLEU only)
-# ────────────────────────────────────────────────────────────────────────────────
-def postprocess_text(preds, labels):
-    preds  = [p.strip() for p in preds]
-    labels = [[l.strip()] for l in labels]
-    return preds, labels
-
-def compute_metrics(eval_preds):
-    preds, labels = eval_preds
-    if isinstance(preds, tuple):
-        preds = preds[0]
-
-    preds  = np.where(preds != -100, preds, tokenizer.pad_token_id)
-    labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
-
-    dec_preds  = tokenizer.batch_decode(preds, skip_special_tokens=True)
-    dec_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
-    dec_preds, dec_labels = postprocess_text(dec_preds, dec_labels)
-
-    # sentence_bleu returns a score in [0,100]
-    bleu_scores = [
-        sentence_bleu([ref.split()], pred.split(), weights=(0.75,0.25,0,0))
-        for pred, ref in zip(dec_preds, dec_labels)
-    ]
-    return {"BLEU": float(np.mean(bleu_scores))}
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 5) Optuna objective
-# ────────────────────────────────────────────────────────────────────────────────
 def objective(trial):
-    # a) sample hyper-params
-    batch_size       = trial.suggest_categorical("batch_size", [8,16,32,64])
-    learning_rate    = trial.suggest_float("learning_rate", 2e-5, 2e-1, log=True)
-    num_train_epochs = trial.suggest_int("num_train_epochs", 7, 15)
-    weight_decay     = trial.suggest_loguniform("weight_decay", 4e-3, 1e-1)
+    # 1) sample hyperparameters
+    batch_size        = trial.suggest_categorical('batch_size',      [4, 8, 16, 32])
+    learning_rate     = trial.suggest_float(     'learning_rate', 2e-5, 2e-1, log=True)
+    num_train_epochs  = trial.suggest_int(       'num_train_epochs', 7,  15)
+    weight_decay      = trial.suggest_loguniform('weight_decay', 4e-3, 1e-1)
 
-    # b) assemble training args
+    # 2) build the Trainer args
     args = Seq2SeqTrainingArguments(
-        output_dir              = "./models/optuna_trial",
-        per_device_train_batch_size = batch_size,
-        per_device_eval_batch_size  = batch_size,
-        learning_rate           = learning_rate,
-        weight_decay            = weight_decay,
-        save_total_limit        = 1,
-        num_train_epochs        = num_train_epochs,
-        predict_with_generate   = True,
-        evaluation_strategy     = "steps",
-        eval_steps              = 100,
+        output_dir                 = "./models/optuna_trial",
+        evaluation_strategy        = "steps",
+        eval_steps                 = 100,
+        learning_rate              = learning_rate,
+        per_device_train_batch_size= batch_size,
+        per_device_eval_batch_size = batch_size,
+        weight_decay               = weight_decay,
+        save_total_limit           = 1,
+        num_train_epochs           = num_train_epochs,
+        predict_with_generate      = True,
     )
 
-    # c) load fresh base + attach LoRA
-    base = T5ForConditionalGeneration.from_pretrained(BASE_CKPT).to(device)
-    for p in base.parameters():
+    # 3) reload a fresh base + LoRA for each trial
+    base_madlad400 = T5ForConditionalGeneration \
+        .from_pretrained(base_madlad400_checkpoint).to(device)
+    for p in base_madlad400.parameters():
         p.requires_grad = False
         if p.ndim == 1:
             p.data = p.data.to(torch.float32)
-    base.gradient_checkpointing_enable()
-    base.enable_input_require_grads()
-    class CastFP32(nn.Sequential):
-        def forward(self, x): return super().forward(x).to(torch.float32)
-    base.lm_head = CastFP32(base.lm_head)
+    base_madlad400.gradient_checkpointing_enable()
+    base_madlad400.enable_input_require_grads()
+    base_madlad400.lm_head = CastOutputToFloat(base_madlad400.lm_head)
 
-    model = get_peft_model(base, lora_config)
+    lora_model = get_peft_model(base_madlad400, lora_config)
+    model_name = lora_model
 
-    # d) trainer
+    # 4) create and run the Trainer
     trainer = Seq2SeqTrainer(
-        model             = model,
-        args              = args,
-        train_dataset     = tokenized_train,
-        eval_dataset      = tokenized_val,
-        data_collator     = data_collator,
-        tokenizer         = tokenizer,
-        compute_metrics   = compute_metrics,
+        model            = model_name,
+        args             = args,
+        train_dataset    = tokenized_train_dataset,
+        eval_dataset     = tokenized_validation_dataset,
+        data_collator    = data_collator,
+        tokenizer        = base_madlad400_tokenizer,
+        compute_metrics  = compute_metrics,
     )
-
-    # e) train + eval
     trainer.train()
-    preds = trainer.predict(tokenized_val)
 
-    # f) debug: print available metric keys
+    # 5) evaluate on your validation set
+    preds = trainer.predict(tokenized_validation_dataset)
     print("▶ metrics keys:", preds.metrics.keys())
+    val_bleu = preds.metrics.get('test_BLEU', 0.0)
+    print(f"▶ trial {trial.number} → test_BLEU = {val_bleu:.2f}")
+    return val_bleu
 
-    # g) return the uppercase metric
-    value = preds.metrics.get("test_BLEU", 0.0)
-    print(f"▶ trial {trial.number} → test_BLEU = {value:.2f}")
-    return value
-
-# ────────────────────────────────────────────────────────────────────────────────
-# 6) Run Optuna
-# ────────────────────────────────────────────────────────────────────────────────
+# 6) Actually run the study
 study = optuna.create_study(
-    direction="maximize",
+    direction='maximize',
     sampler=optuna.samplers.TPESampler(),
     pruner=optuna.pruners.HyperbandPruner()
 )
 study.optimize(objective, n_trials=5)
 
-# ────────────────────────────────────────────────────────────────────────────────
-# 7) Print best
-# ────────────────────────────────────────────────────────────────────────────────
-print("Best hyperparameters: ", study.best_params)
-print("Best performance (BLEU): ", study.best_value)
+# 7) Print out the best found
+print("Best hyperparameters:", study.best_params)
+print("Best performance (BLEU):", study.best_value)
