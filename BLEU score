@@ -183,3 +183,72 @@ if score > best_bleu:
 print("▶ Best generation config:", best_cfg, "→ BLEU:", best_bleu)
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#!/usr/bin/env python
+import os
+import sys
+import argparse
+
+from translation_evaluator import TranslationEvaluator
+
+def main(input_files, output_dir):
+    # 1) ensure we have at least one file
+    if not input_files:
+        print("► Error: no input files provided.  Please pass at least one .xlsx/.xls file.")
+        sys.exit(1)
+
+    # 2) make sure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 3) tell the evaluator where to write the Excel report
+    output_path = os.path.join(output_dir, "translation_metrics_report.xlsx")
+    evaluator = TranslationEvaluator(output_file=output_path)
+
+    # 4) load each file
+    for fp in input_files:
+        print(f"▶ Loading data from {fp}")
+        evaluator.load_data(fp)
+
+    # 5) run the metrics (customize cols if you like)
+    evaluator.evaluate(
+        prediction_cols = ["candidate"],
+        reference_col   = "reference",
+        metrics         = ["BLEU", "ChrF", "ChrF++"],
+        keep_cols       = ["es"]            # list any extra columns you want carried through
+    )
+
+    # 6) write out the Excel workbook
+    evaluator.generate_report()
+    print(f"\n✔ All done!  Report saved to:\n    {output_path}")
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="Run NLP Metric Calculator")
+    p.add_argument(
+        "--output_dir",
+        type=str,
+        required=True,
+        help="Directory where the generatedResults .xlsx will be saved"
+    )
+    p.add_argument(
+        "files",
+        nargs="+",
+        help="One or more input Excel files (csv/xls/xlsx) to process"
+    )
+    args = p.parse_args()
+
+    print(f"→ Output directory: {args.output_dir}")
+    print(f"→ Input files:     {args.files}\n")
+    main(args.files, args.output_dir)
