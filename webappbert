@@ -1,96 +1,150 @@
 #!/usr/bin/env python3
+"""
+Bertscore.py
+
+Compute sentence‐level BERTScore (precision, recall, F1) for one or more
+Excel/CSV files, then write both the per‐sentence details and the macro‐
+averaged summary into an Excel workbook.
+"""
+
 import os
 import sys
 import warnings
 from pathlib import Path
+from typing import Union
+
 import pandas as pd
-import numpy as np
-import evaluate
+import evaluate  # HuggingFace evaluate library
+
 
 class BertScoreEvaluator:
-    """
-    Load data, compute sentence‐level BERTScore (P/R/F1), write
-    both detailed and macro‐average results to Excel.
-    """
     def __init__(
         self,
-        output_file: Path,
-        model_type: str = "roberta-large",
-        num_layers: int = None,
-        device: str = None,
+        output_file: Union[str, Path] = "Bertscore_output.xlsx",
+        model_cache: Union[str, Path] = None,
+        model_name_or_path: str = "roberta-large",
+        language: str = "en",
+        num_layers: int = 17,
     ):
-        # allow user to override where HF cache lives
-        # e.g. os.environ["TRANSFORMERS_CACHE"] = "/path/to/cache"
-        warnings.simplefilter("ignore", UserWarning)
+        # 1) If you have a local copy of Roberta‐large, point to it here:
+        if model_cache:
+            os.environ["TRANSFORMERS_CACHE"] = str(model_cache)
 
-        self.scorer = evaluate.load("bertscore")
+        # 2) Save args
+        self._output_file = Path(output_file)
+        self._model_name_or_path = model_name_or_path
+        self._language = language
+        self._num_layers = num_layers
+
+        # 3) Load the metric
+        try:
+            self.scorer = evaluate.load("bertscore")
+            print(f"✅ Loaded BERTScore metric '{self._model_name_or_path}'")
+        except Exception as e:
+            print("❌ Failed to load BERTScore metric:", e, file=sys.stderr)
+            self.scorer = None
+
+        # placeholders
         self._data = None
-        self._detailed = None
-        self._summary = None
+        self._detailed_results = None
+        self._model_metrics = None
 
-        self.output_file = Path(output_file)
-        self.model_type = model_type
-        self.num_layers = num_layers
-        self.device = device or ("cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu")
-
-    def load_data(self, file_path: Path):
-        file_path = Path(file_path)
-        if file_path.suffix.lower() == ".csv":
-            self._data = pd.read_csv(file_path)
-        elif file_path.suffix.lower() in {".xls", ".xlsx"}:
-            self._data = pd.read_excel(file_path)
+    def load_data(self, file_path: Union[str, Path]) -> None:
+        """Read a CSV or Excel into self._data."""
+        fp = Path(file_path)
+        if not fp.exists():
+            raise FileNotFoundError(f"Input file not found: {fp}")
+        if fp.suffix.lower() == ".csv":
+            self._data = pd.read_csv(fp)
+        elif fp.suffix.lower() in (".xls", ".xlsx"):
+            self._data = pd.read_excel(fp)
         else:
-            raise ValueError(f"Unsupported file type: {file_path.suffix!r}")
+            raise ValueError(f"Unsupported file type: {fp.suffix}")
 
-    def evaluate(self, prediction_col="candidate", reference_col="reference"):
+        # require these two columns
+        for col in ("reference", "candidate"):
+            if col not in self._data.columns:
+                raise ValueError(f"Excel must have a '{col}' column")
+
+    def evaluate(self) -> None:
+        """Compute BERTScore for each sentence and aggregate."""
+        if self.scorer is None:
+            raise RuntimeError("Metric not loaded, cannot evaluate.")
         if self._data is None:
-            raise ValueError("No data loaded. Call load_data() first.")
+            raise RuntimeError("No data loaded. Call load_data() first.")
 
         df = self._data.copy()
-        # ensure strings
-        preds = df[prediction_col].astype(str).tolist()
-        refs  = df[reference_col].astype(str).tolist()
 
-        # compute batched BERTScore
-        res = self.scorer.compute(
+        # prepare inputs as lists of strings
+        preds = df["candidate"].astype(str).str.strip().tolist()
+        refs = df["reference"].astype(str).str.strip().tolist()
+
+        # run the metric
+        out = self.scorer.compute(
             predictions=preds,
             references=refs,
-            model_type=self.model_type,
-            num_layers=self.num_layers,
-            device=self.device,
-            lang="en",
+            model_type=self._model_name_or_path,
+            num_layers=self._num_layers,
+            idf=False,
+            device="cpu",  # or "cuda" if available
+            lang=self._language,
+            batch_size=8,
         )
 
-        # attach to df
-        df["precision"] = res["precision"]
-        df["recall"]    = res["recall"]
-        df["f1"]        = res["f1"]
+        # attach per‐sentence results
+        df["precision"] = out["precision"]
+        df["recall"]    = out["recall"]
+        df["f1"]        = out["f1"]
 
-        # store detailed + summary
-        self._detailed = df[[reference_col, prediction_col, "precision","recall","f1"]]
-        mean_p = np.mean(res["precision"])
-        mean_r = np.mean(res["recall"])
-        mean_f = np.mean(res["f1"])
-        self._summary = pd.DataFrame([{
-            "Model":          self.model_type,
-            "Precision_mean": mean_p,
-            "Recall_mean":    mean_r,
-            "F1_mean":        mean_f,
-        }])
+        self._detailed_results = df[
+            ["reference", "candidate", "precision", "recall", "f1"]
+        ]
 
-    def generate_report(self):
-        # ensure parent exists
-        self.output_file.parent.mkdir(parents=True, exist_ok=True)
-        with pd.ExcelWriter(self.output_file, engine="xlsxwriter") as writer:
-            # 1) detailed per‐sentence
-            self._detailed.to_excel(
+        # compute macro‐avg
+        self._model_metrics = pd.DataFrame(
+            [
+                {
+                    "Model": self._model_name_or_path,
+                    "Precision": float(self._detailed_results["precision"].mean()),
+                    "Recall":    float(self._detailed_results["recall"].mean()),
+                    "F1":        float(self._detailed_results["f1"].mean()),
+                }
+            ]
+        )
+
+    def generate_report(self) -> None:
+        """Write the detailed + model‐level sheets to the Excel file."""
+        out_path = self._output_file
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
+            # per‐sentence
+            self._detailed_results.to_excel(
                 writer, sheet_name="Detailed metrics", index=False
             )
-            # 2) macro‐average summary
-            self._summary.to_excel(
+            # summary
+            self._model_metrics.to_excel(
                 writer, sheet_name="Model metrics", index=False
             )
-        print(f"✅ Report saved to: {self.output_file.resolve()}")
+
+            # add a nice formatted table on the summary sheet
+            workbook  = writer.book
+            worksheet = writer.sheets["Model metrics"]
+            nrows, ncols = self._model_metrics.shape
+            headers = [{"header": c} for c in self._model_metrics.columns]
+            worksheet.add_table(
+                0, 0, nrows, ncols-1,
+                {"columns": headers, "style": "Table Style Medium 9", "name": "ModelMetrics"}
+            )
+            # auto‐width
+            for idx, col in enumerate(self._model_metrics.columns):
+                max_len = max(
+                    self._model_metrics[col].astype(str).map(len).max(),
+                    len(col)
+                ) + 2
+                worksheet.set_column(idx, idx, max_len)
+
+        print(f"🎉 Report saved to: {out_path.resolve()}")
 
 
 
@@ -98,54 +152,61 @@ if __name__ == "__main__":
     import argparse
 
     p = argparse.ArgumentParser(
-        description="Run BERTScore evaluation on one or more files"
+        description="Run BERTScoreEvaluator on one or more files"
     )
     p.add_argument(
         "--output_dir",
         type=Path,
         required=True,
-        help="Directory in which to write the Excel report"
+        help="Directory in which to write the Excel report",
+    )
+    p.add_argument(
+        "--model_cache",
+        type=Path,
+        default=None,
+        help="(Optional) local HF cache directory for Roberta‐large",
     )
     p.add_argument(
         "--model_type",
         type=str,
         default="roberta-large",
-        help="HuggingFace model to use for BERTScore"
+        help="HuggingFace model ID or local path for BERTScore",
+    )
+    p.add_argument(
+        "--language",
+        type=str,
+        default="en",
+        help="Language code for BERTScore",
     )
     p.add_argument(
         "--num_layers",
         type=int,
-        default=None,
-        help="How many transformer layers to use (default: all)"
-    )
-    p.add_argument(
-        "--device",
-        type=str,
-        default=None,
-        help="Device for scoring (cuda or cpu)"
+        default=17,
+        help="How many layers to use for BERTScore",
     )
     p.add_argument(
         "files",
         nargs="+",
-        help="One or more input CSV/XLS/XLSX files"
+        help="One or more input .csv/.xls/.xlsx files to process",
     )
+
     args = p.parse_args()
 
+    # prepare output path
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     output_path = out_dir / "Bertscore_output.xlsx"
 
+    # run it
     evaluator = BertScoreEvaluator(
         output_file=output_path,
-        model_type=args.model_type,
+        model_cache=args.model_cache,
+        model_name_or_path=args.model_type,
+        language=args.language,
         num_layers=args.num_layers,
-        device=args.device,
     )
-
     for f in args.files:
-        print(f"📥 Loading data from {f}")
         evaluator.load_data(f)
-
-    print("▶️ Computing BERTScore...")
     evaluator.evaluate()
     evaluator.generate_report()
+    print("✅ All done!")
