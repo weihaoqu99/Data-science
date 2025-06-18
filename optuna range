@@ -1,3 +1,21 @@
+import torch
+from transformers import T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+import optuna
+
+# re-declare device here
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+def objective(trial):
+    # ... your existing sampling code ...
+
+    # reload fresh base → now device is defined
+    base_madlad400 = T5ForConditionalGeneration \
+        .from_pretrained(base_madlad400_checkpoint) \
+        .to(device)
+
+    # rest of your code unchanged...
+
+
 import optuna
 from transformers import T5ForConditionalGeneration, Seq2SeqTrainingArguments, Seq2SeqTrainer
 
