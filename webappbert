@@ -5,49 +5,42 @@ import warnings
 from pathlib import Path
 
 import pandas as pd
-from bert_score import BERTScorer
+import torch
+import torch.nn.functional as F
+from transformers import AutoTokenizer, AutoModel
 
 # ─── Offline HuggingFace setup ─────────────────────────────────────────────────
-# Point at your locally-cached roberta-large model and its baseline TSV:
-MODEL_PATH = os.getenv(
-    "BERT",
-    "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-)
-BASELINE_PATH = os.getenv(
-    "BASELINE",
-    "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/en/roberta-large.tsv"
-)
-# Force transformers into offline mode and use your cache dir
+MODEL_PATH = "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
 os.environ["TRANSFORMERS_CACHE"]   = MODEL_PATH
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 # ────────────────────────────────────────────────────────────────────────────────
 
 class BertScoreEvaluator:
     """
-    Load data
-    Compute sentence-level BERTScore (P, R, F1)
-    Compute macro-average model metrics
-    Write Detailed + Model metrics to Excel
+    1) Load one or more input files (CSV/XLSX)
+    2) Compute per-sentence BERTScore (P, R, F1)
+    3) Compute macro-average over all sentences
+    4) Write two sheets: Detailed metrics + Model metrics
     """
-    def __init__(self, output_file: Path):
+    def __init__(self, output_file: Path, device: str = "cpu"):
         warnings.simplefilter("ignore")
+        self.device    = torch.device(device)
+        # load tokenizer & model from local path
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            MODEL_PATH, local_files_only=True
+        )
+        self.model     = AutoModel.from_pretrained(
+            MODEL_PATH, local_files_only=True
+        ).to(self.device)
+        self.model.eval()
+
         self._data     = None
         self._detailed = None
         self._summary  = None
-        self._out      = Path(output_file)
-
-        # initialize scorer with local model & baseline, explicitly setting num_layers=24
-        self._scorer = BERTScorer(
-            lang="en",
-            rescale_with_baseline=True,
-            model_type=MODEL_PATH,
-            baseline_path=BASELINE_PATH,
-            num_layers=24,
-            device=os.getenv("DEVICE", "cpu"),
-        )
+        self._out      = output_file
 
     def load_data(self, fp: Path):
-        """Read one Excel or CSV file (concatenate if called multiple times)."""
+        """Read one CSV/XLSX, concatenate if called multiple times."""
         suffix = fp.suffix.lower()
         if suffix in (".xls", ".xlsx"):
             df = pd.read_excel(fp)
@@ -61,72 +54,89 @@ class BertScoreEvaluator:
         else:
             self._data = pd.concat([self._data, df], ignore_index=True)
 
+    def _score_pair(self, cand: str, ref: str):
+        """Return (P, R, F1) for a single sentence pair."""
+        # tokenize + encode
+        enc_c = self.tokenizer(cand, return_tensors="pt", truncation=True, max_length=512)
+        enc_r = self.tokenizer(ref, return_tensors="pt", truncation=True, max_length=512)
+        with torch.no_grad():
+            out_c = self.model(**{k:v.to(self.device) for k,v in enc_c.items()})
+            out_r = self.model(**{k:v.to(self.device) for k,v in enc_r.items()})
+        # take last hidden state, normalize
+        emb_c = F.normalize(out_c.last_hidden_state.squeeze(0), dim=1)  # (len_c, d)
+        emb_r = F.normalize(out_r.last_hidden_state.squeeze(0), dim=1)  # (len_r, d)
+        # similarity matrix
+        sim = emb_c @ emb_r.T
+        # precision = mean over cand‐tokens of max(sim to any ref‐token)
+        p = sim.max(dim=1).values.mean().item()
+        # recall = mean over ref‐tokens of max(sim to any cand‐token)
+        r = sim.max(dim=0).values.mean().item()
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+        return p, r, f1
+
     def evaluate(
         self,
         prediction_cols: list = ["candidate"],
-        reference_col: str = "reference",
-        keep_cols: list = None
+        reference_col:    str  = "reference",
+        keep_cols:        list = None
     ):
-        """Compute per-sentence and macro-average BERTScore."""
+        """Compute detailed + summary BERTScore over the loaded data."""
         if self._data is None:
-            raise ValueError("No data loaded—call load_data() first")
+            raise ValueError("No data loaded. Call load_data() first.")
 
+        df = self._data.copy().astype(str)
         keep = keep_cols or []
         if reference_col not in keep:
             keep = [reference_col] + keep
 
-        missing = [c for c in [reference_col] + prediction_cols + keep if c not in self._data.columns]
-        if missing:
-            raise ValueError(f"Columns not found in data: {missing}")
+        # per‐sentence
+        for pcol in prediction_cols:
+            ps, rs, fs = [], [], []
+            for _, row in df.iterrows():
+                p, r, f = self._score_pair(row[pcol], row[reference_col])
+                ps.append(p); rs.append(r); fs.append(f)
+            df[f"{pcol} BERT-P"]  = ps
+            df[f"{pcol} BERT-R"]  = rs
+            df[f"{pcol} BERT-F1"] = fs
 
-        df = self._data.copy().astype(str)
-        for p in prediction_cols:
-            preds = df[p].tolist()
-            refs  = [[r] for r in df[reference_col].tolist()]
-            P, R, F1 = self._scorer.score(preds, refs)
-
-            df[f"{p} BERT-P"]  = P.tolist()
-            df[f"{p} BERT-R"]  = R.tolist()
-            df[f"{p} BERT-F1"] = F1.tolist()
-
-        # build detailed per-sentence DataFrame
+        # Detailed sheet
         cols = keep.copy()
-        for p in prediction_cols:
-            cols.append(p)
-            cols += [f"{p} BERT-P", f"{p} BERT-R", f"{p} BERT-F1"]
+        for pcol in prediction_cols:
+            cols.append(pcol)
+            cols += [f"{pcol} BERT-P", f"{pcol} BERT-R", f"{pcol} BERT-F1"]
         self._detailed = df[cols]
 
-        # build macro-average summary DataFrame
+        # Macro‐average summary
         rows = []
-        for p in prediction_cols:
+        for pcol in prediction_cols:
             rows.append({
-                "Model": p,
-                "BERT-P": self._detailed[f"{p} BERT-P"].mean(),
-                "BERT-R": self._detailed[f"{p} BERT-R"].mean(),
-                "BERT-F1": self._detailed[f"{p} BERT-F1"].mean()
+                "Model": pcol,
+                "BERT-P": df[f"{pcol} BERT-P"].mean(),
+                "BERT-R": df[f"{pcol} BERT-R"].mean(),
+                "BERT-F1":df[f"{pcol} BERT-F1"].mean()
             })
         self._summary = pd.DataFrame(rows)
 
     def generate_report(self):
-        """Write out Excel with two sheets: Detailed metrics + Model metrics."""
-        self._out.parent.mkdir(parents=True, exist_ok=True)
+        """Write out the two‐sheet Excel file."""
+        self._out.parent.mkdir(exist_ok=True, parents=True)
         with pd.ExcelWriter(self._out, engine="xlsxwriter") as writer:
-            # 1) detailed per-sentence (optional; JSON reads only “Model metrics”)
+            # 1) Detailed per‐sentence (you’ll ignore this in the JSON)
             self._detailed.to_excel(writer, sheet_name="Detailed metrics", index=False)
-            # 2) macro-average summary (what webapp reads)
+            # 2) Macro‐avg summary (your webapp reads “Model metrics”)
             self._summary.to_excel(writer, sheet_name="Model metrics", index=False)
 
-            # format “Model metrics” sheet as a styled table
+            # format the Model metrics sheet
             wb = writer.book
             ws = writer.sheets["Model metrics"]
             max_row, max_col = self._summary.shape
             headers = [{"header": c} for c in self._summary.columns]
-            ws.add_table(0, 0, max_row, max_col - 1, {
+            ws.add_table(0, 0, max_row, max_col-1, {
                 "columns": headers,
-                "style": "Table Style Medium 9",
-                "name": "BertScoreSummary"
+                "style":   "Table Style Medium 9",
+                "name":    "BertScoreSummary"
             })
-            # auto-fit widths
+            # auto‐fit
             for idx, col in enumerate(self._summary.columns):
                 width = max(self._summary[col].astype(str).map(len).max(), len(col)) + 2
                 ws.set_column(idx, idx, width)
@@ -135,7 +145,7 @@ class BertScoreEvaluator:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute BERTScore metrics")
+    parser = argparse.ArgumentParser(description="Compute offline BERTScore")
     parser.add_argument(
         "--output_dir",
         type=Path,
@@ -149,13 +159,13 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    out_dir   = args.output_dir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    output_fp = out_dir / "Bertscore_output.xlsx"
+    out_dir  = args.output_dir
+    out_dir.mkdir(exist_ok=True, parents=True)
+    out_fp   = out_dir / "Bertscore_output.xlsx"
 
-    evaluator = BertScoreEvaluator(output_file=output_fp)
+    evaluator = BertScoreEvaluator(output_file=out_fp, device="cpu")
     for f in args.files:
-        print(f"▶ Loading data from {f}")
+        print(f"▶ Loading   {f}")
         evaluator.load_data(Path(f))
 
     evaluator.evaluate(
