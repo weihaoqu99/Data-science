@@ -1,96 +1,146 @@
-#!/usr/bin/env python3
-"""
-Compute BERTScore for one or more Excel files with 'reference' and 'candidate' columns,
-and write out a two-sheet Excel report (Detailed_metrics + Model_metrics).
-"""
-
-import os
+#!/usr/bin/env python
 import sys
+import os
 import argparse
+import warnings
 from pathlib import Path
 
 import pandas as pd
-import evaluate
+from bert_score import BERTScorer
 
-# ──────────────────────────────────────────────────────────────────────────────
-# hard-code your local roberta-large checkout so evaluate.load("bertscore")
-# will pick it up without touching server.py or your JSON config:
-MODEL_CACHE = r"C:\Users\ZKC7HOU\Documents\4. BERT score\roberta-large"
-# ──────────────────────────────────────────────────────────────────────────────
 
-def compute_bertscore(file_paths, output_dir: Path):
-    # point HF to your local model before loading
-    os.environ["TRANSFORMERS_CACHE"] = MODEL_CACHE
+class BertScoreEvaluator:
+    """
+    Load data
+    Compute sentence-level BERTScore (P, R, F1)
+    Compute macro-average model metrics
+    Write Detailed + Model metrics to Excel
+    """
+    def __init__(self, output_file: Path):
+        # === optional: set your transformers cache/model path if needed ===
+        # os.environ["TRANSFORMERS_CACHE"] = r"C:/Users/…/roberta-large"
+        warnings.simplefilter("ignore")
 
-    try:
-        scorer = evaluate.load("bertscore")
-        print(f"✅ Loaded BERTScore metric (cache={MODEL_CACHE})")
-    except Exception as e:
-        print(f"❌ Failed to load BERTScore metric: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    all_dfs = []
-    summary = []
-
-    for fp in file_paths:
-        df = pd.read_excel(fp)
-        if not {"reference", "candidate"}.issubset(df.columns):
-            print(f"❌ {fp} is missing a required column", file=sys.stderr)
-            sys.exit(1)
-
-        # compute per-sentence BERTScore
-        out = scorer.compute(
-            predictions=df["candidate"].astype(str).tolist(),
-            references=df["reference"].astype(str).tolist(),
-            model_type=MODEL_CACHE,
-            device="cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu",
+        self._data = None
+        self._detailed = None
+        self._summary = None
+        self._out = Path(output_file)
+        # instantiate a scorer (English, rescale with baseline, using roberta-large)
+        self._scorer = BERTScorer(
+            lang="en",
+            rescale_with_baseline=True,
+            model_type="roberta-large"
         )
 
-        # attach back to a copy of the original
-        df2 = df.copy()
-        df2["precision"] = out["precision"]
-        df2["recall"]    = out["recall"]
-        df2["f1"]        = out["f1"]
-        all_dfs.append(df2)
+    def load_data(self, fp: Path):
+        if fp.suffix in (".xls", ".xlsx"):
+            self._data = pd.read_excel(fp)
+        elif fp.suffix == ".csv":
+            self._data = pd.read_csv(fp)
+        else:
+            raise ValueError(f"Unsupported file type {fp.suffix}")
 
-        # macro-average for this file
-        summary.append({
-            "file":      Path(fp).name,
-            "precision": sum(out["precision"]) / len(out["precision"]),
-            "recall":    sum(out["recall"])    / len(out["recall"]),
-            "f1":        sum(out["f1"])        / len(out["f1"]),
-        })
+    def evaluate(
+        self,
+        prediction_cols: list = ["candidate"],
+        reference_col: str = "reference",
+        keep_cols: list = None
+    ):
+        if self._data is None:
+            raise ValueError("No data loaded – call load_data() first")
 
-    # concat detailed + build summary DF
-    detailed_df = pd.concat(all_dfs, ignore_index=True)
-    summary_df  = pd.DataFrame(summary)
+        keep = keep_cols or []
+        if reference_col not in keep:
+            keep = [reference_col] + keep
 
-    # write to Excel
-    report_path = output_dir / "Bertscore_output.xlsx"
-    with pd.ExcelWriter(report_path, engine="xlsxwriter") as writer:
-        detailed_df.to_excel(writer, sheet_name="Detailed_metrics", index=False)
-        summary_df.to_excel(writer,  sheet_name="Model_metrics",    index=False)
+        # validate columns
+        missing = [c for c in [reference_col] + prediction_cols + keep if c not in self._data.columns]
+        if missing:
+            raise ValueError(f"Columns not found in data: {missing}")
 
-    print(f"\n✅ All done! Report saved to:\n   {report_path.resolve()}")
+        df = self._data.copy()
+        # for each prediction column, compute P/R/F1 lists
+        for p in prediction_cols:
+            preds = df[p].astype(str).tolist()
+            refs  = [[r] for r in df[reference_col].astype(str).tolist()]
+            P, R, F1 = self._scorer.score(preds, refs)
+            df[f"{p} BERT-P"]  = P.tolist()
+            df[f"{p} BERT-R"]  = R.tolist()
+            df[f"{p} BERT-F1"] = F1.tolist()
+
+        # assemble detailed DataFrame
+        cols = keep.copy()
+        for p in prediction_cols:
+            cols.append(p)
+            cols += [f"{p} BERT-P", f"{p} BERT-R", f"{p} BERT-F1"]
+        self._detailed = df[cols]
+
+        # macro-average summary
+        rows = []
+        for p in prediction_cols:
+            rows.append({
+                "Model": p,
+                "BERT-P": self._detailed[f"{p} BERT-P"].mean(),
+                "BERT-R": self._detailed[f"{p} BERT-R"].mean(),
+                "BERT-F1": self._detailed[f"{p} BERT-F1"].mean()
+            })
+        self._summary = pd.DataFrame(rows)
+
+    def generate_report(self):
+        # ensure output dir exists
+        self._out.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(self._out, engine="xlsxwriter") as writer:
+            # detailed per-sentence (optional; you only read “Model metrics” for the webapp)
+            self._detailed.to_excel(writer, sheet_name="Detailed metrics", index=False)
+            # macro-avg summary
+            self._summary.to_excel(writer, sheet_name="Model metrics", index=False)
+
+            # format the summary sheet as a nice table
+            wb = writer.book
+            ws = writer.sheets["Model metrics"]
+            max_row, max_col = self._summary.shape
+            headers = [{"header": c} for c in self._summary.columns]
+            ws.add_table(0, 0, max_row, max_col - 1, {
+                "columns": headers,
+                "style": "Table Style Medium 9",
+                "name": "BertScoreSummary"
+            })
+            # auto-fit columns
+            for idx, col in enumerate(self._summary.columns):
+                width = max(self._summary[col].astype(str).map(len).max(), len(col)) + 2
+                ws.set_column(idx, idx, width)
+
+        print(f"✔️ Report saved to {self._out.resolve()}")
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description="Run BERTScore over Excel files")
-    p.add_argument(
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Compute BERTScore metrics")
+    parser.add_argument(
         "--output_dir",
         type=Path,
         required=True,
         help="Directory in which to write Bertscore_output.xlsx"
     )
-    p.add_argument(
+    parser.add_argument(
         "files",
         nargs="+",
-        help="One or more input Excel files (.xls/.xlsx) to process"
+        help="One or more input .csv/.xls/.xlsx files"
     )
-    return p.parse_args()
+    args = parser.parse_args()
 
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / "Bertscore_output.xlsx"
 
-if __name__ == "__main__":
-    args = parse_args()
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    compute_bertscore(args.files, args.output_dir)
+    evaluator = BertScoreEvaluator(output_file=output_path)
+    for f in args.files:
+        print(f"▶ Loading {f}")
+        evaluator.load_data(Path(f))
+
+    evaluator.evaluate(
+        prediction_cols=["candidate"],
+        reference_col="reference",
+        keep_cols=None
+    )
+    evaluator.generate_report()
+    print("✅ All done!")
