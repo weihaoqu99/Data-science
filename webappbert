@@ -1,1 +1,105 @@
-hi
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+import traceback
+from pathlib import Path
+
+import pandas as pd
+import evaluate   # huggingface/evaluate
+
+# -----------------------------------------------------------------------------
+# 1) Load the metric at import time
+# -----------------------------------------------------------------------------
+MODEL_PATH = os.getenv("BERT", "/appdata/shared/libs/huggingface/roberta-large")
+DEVICE     = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+
+try:
+    scorer = evaluate.load("bertscore")
+    print("✔ Loaded local BERTScore metric")
+except Exception as e:
+    print("✘ Failed to load BERTScore metric:", e, file=sys.stderr)
+    scorer = None
+
+
+# -----------------------------------------------------------------------------
+# 2) The main() function does all the work
+# -----------------------------------------------------------------------------
+def main(input_paths, output_dir):
+    if scorer is None:
+        print("ERROR: BERTScore metric not loaded", file=sys.stderr)
+        sys.exit(1)
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for inp in input_paths:
+        inp = Path(inp)
+        print(f">> Reading {inp}")
+        try:
+            df = pd.read_excel(inp)
+        except Exception as e:
+            print(f"ERROR reading {inp}: {e}", file=sys.stderr)
+            continue
+
+        # validate
+        for col in ("reference", "candidate"):
+            if col not in df.columns:
+                print(f"ERROR: missing column '{col}' in {inp}", file=sys.stderr)
+                continue
+
+        # compute
+        try:
+            out = scorer.compute(
+                predictions = df["candidate"].astype(str).str.strip().tolist(),
+                references  = df["reference"].astype(str).str.strip().tolist(),
+                model_type  = MODEL_PATH,
+                num_layers  = 17,
+                device      = DEVICE,
+                rescale_with_baseline = True,
+                baseline_path = str(Path(MODEL_PATH) / "en" / "roberta-large.tsv"),
+                lang        = "en",
+            )
+        except Exception:
+            print("ERROR during scorer.compute:\n" + traceback.format_exc(),
+                  file=sys.stderr)
+            continue
+
+        # attach results
+        df["precision"] = [round(min(max(x, 0.0), 1.0), 6) for x in out["precision"]]
+        df["recall"]    = [round(min(max(x, 0.0), 1.0), 6) for x in out["recall"]]
+        df["f1"]        = [round(min(max(x, 0.0), 1.0), 6) for x in out["f1"]]
+
+        # write out
+        basename = inp.stem + "_bertscore.xlsx"
+        out_path = Path(output_dir) / basename
+        try:
+            df.to_excel(out_path, index=False)
+            print(f"✔ Wrote {out_path}")
+        except Exception:
+            print(f"ERROR writing {out_path}:\n" + traceback.format_exc(),
+                  file=sys.stderr)
+
+
+# -----------------------------------------------------------------------------
+# 3) CLI entrypoint
+# -----------------------------------------------------------------------------
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(
+        description="Compute BERTScore (with baseline) on one or more Excel files."
+    )
+    p.add_argument(
+        "-o", "--output_dir",
+        type=str, required=True,
+        help="Directory where the `.xlsx` reports will be saved"
+    )
+    p.add_argument(
+        "files",
+        nargs="+",
+        help="One or more `.xls`/`.xlsx` files with `reference` & `candidate` columns"
+    )
+    args = p.parse_args()
+
+    print(f"→ output_dir: {args.output_dir}")
+    print(f"→ input files: {args.files}")
+    main(args.files, args.output_dir)
+
