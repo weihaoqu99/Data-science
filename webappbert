@@ -1,49 +1,61 @@
-#!/usr/bin/env python
-import sys, os, argparse, tempfile, traceback
+#!/usr/bin/env python3
+import os, argparse
 import pandas as pd
-import evaluate   # huggingface evaluate
-# … any imports you need …
+import evaluate
 
 def main(input_files, output_dir):
+    # 1) make sure output folder exists
     os.makedirs(output_dir, exist_ok=True)
+
+    # 2) path where web app will look
     out_path = os.path.join(output_dir, "Bertscore_output.xlsx")
 
-    # — load your scorer once —
-    DEVICE = "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
+    # 3) load the HF evaluate API
+    device = "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
     scorer = evaluate.load("bertscore")
 
-    # — for each Excel file, read & score —
     all_dfs = []
     for fp in input_files:
         df = pd.read_excel(fp)
-        # validate “reference” & “candidate” columns …
+        # require these two columns
+        for c in ("reference","candidate"):
+            if c not in df.columns:
+                raise ValueError(f"Missing '{c}' column in {fp}")
+
         res = scorer.compute(
-            predictions=df["candidate"].apply(str).tolist(),
-            references=df["reference"].apply(str).tolist(),
-            model_type="roberta-large",
-            device=DEVICE,
-            num_layers=17,
-            rescale_with_baseline=True,
-            baseline_path="/path/to/roberta-large.tsv",
-            lang="en",
+            predictions = df["candidate"].astype(str).tolist(),
+            references  = df["reference"].astype(str).tolist(),
+            model_type  = "roberta-large",
+            device      = device,
+            num_layers  = 17,
+            rescale_with_baseline = True,
+            baseline_path = "/path/to/roberta-large.tsv",
+            lang        = "en"
         )
-        # stick precision/recall/f1 onto df
+
         df["precision"] = res["precision"]
         df["recall"]    = res["recall"]
         df["f1"]        = res["f1"]
         all_dfs.append(df)
 
-    # — concat & write out sheets —
+    # 4) write exactly one sheet named "Sheet1"
     with pd.ExcelWriter(out_path, engine="xlsxwriter") as writer:
-        pd.concat(all_dfs).to_excel(writer, sheet_name="Sheet1", index=False)
+        pd.concat(all_dfs, ignore_index=True) \
+          .to_excel(writer, sheet_name="Sheet1", index=False)
 
     print(f"Report saved to: {out_path}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run BERTScore Metric Calculator")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Directory to save generatedResults .xlsx")
-    parser.add_argument("files", nargs="+",
-                        help="One or more input Excel files (xls/xlsx) to process")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser(
+        description="Run BERTScore Metric Calculator"
+    )
+    p.add_argument(
+        "--output_dir", type=str, required=True,
+        help="Directory where generatedResults .xlsx will be saved"
+    )
+    p.add_argument(
+        "files", nargs="+",
+        help="One or more input Excel files (xls/xlsx) to process"
+    )
+    args = p.parse_args()
     main(args.files, args.output_dir)
