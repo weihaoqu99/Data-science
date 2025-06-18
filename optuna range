@@ -1,0 +1,44 @@
+def objective(trial):
+    # 1) Sample hyper-parameters
+    batch_size      = trial.suggest_categorical('batch_size',     [8, 16, 32, 64])
+    learning_rate   = trial.suggest_float(     'learning_rate', 2e-5, 2e-1, log=True)
+    num_train_epochs= trial.suggest_int(       'num_train_epochs', 7, 15)
+    weight_decay    = trial.suggest_loguniform( 'weight_decay', 4e-3, 1e-1)
+
+    # 2) Build your Seq2Seq args *using* those suggestions
+    args = Seq2SeqTrainingArguments(
+        output_dir              = "models/optuna",
+        evaluation_strategy     = "steps",      # ensure eval during training
+        eval_steps              = 100,
+        learning_rate           = learning_rate,
+        per_device_train_batch_size = batch_size,
+        per_device_eval_batch_size  = batch_size,
+        weight_decay            = weight_decay,
+        save_total_limit        = 1,
+        num_train_epochs        = num_train_epochs,
+        predict_with_generate   = True,
+    )
+
+    # 3) Fresh model + LoRA for each trial
+    model = get_peft_model(base_model, lora_config)
+    trainer = Seq2SeqTrainer(
+        model            = model,
+        args             = args,
+        train_dataset    = tokenized_train_dataset,
+        eval_dataset     = tokenized_validation_dataset,
+        data_collator    = data_collator,
+        tokenizer        = tokenizer,
+        compute_metrics  = compute_metrics,
+    )
+
+    # 4) Train and then evaluate
+    trainer.train()
+    predictions = trainer.predict(tokenized_validation_dataset)
+
+    # 5) Inspect exactly what keys you got back
+    print("▶ Available metrics:", predictions.metrics.keys())
+
+    # 6) Return the uppercase BLEU
+    bleu = predictions.metrics.get('test_BLEU', 0.0)
+    print(f"▶ Trial {trial.number} → test_BLEU = {bleu:.2f}")
+    return bleu
