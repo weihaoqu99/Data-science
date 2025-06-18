@@ -1,12 +1,15 @@
-pip install pandas sacrebleu xlsxwriter openpyxl
-
+#!/usr/bin/env python
+import sys
+import os
+import argparse
+import warnings
+from pathlib import Path
+from typing import Union, List, Optional
 
 import pandas as pd
 from sacrebleu import sentence_bleu, sentence_chrf
 from sacrebleu.metrics import CHRF
-from pathlib import Path
-from typing import Union, List, Optional
-import warnings, os
+
 
 class TranslationEvaluator:
     """
@@ -16,9 +19,11 @@ class TranslationEvaluator:
     Write Detailed + Model metrics to Excel
     """
 
-    def __init__(self, output_file: Union[str, Path] = "output_data.xlsx"):
+    def __init__(self, output_file: Union[str, Path] = "BleuChrfscores_output.xlsx"):
         # optional cache setting for COMET/BERTScore later
-        os.environ["TRANSFORMERS_CACHE"] = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+        os.environ["TRANSFORMERS_CACHE"] = (
+            r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+        )
         warnings.simplefilter("ignore")
 
         self._data = None
@@ -59,7 +64,10 @@ class TranslationEvaluator:
         prediction_cols: List[str],
         keep_cols: List[str]
     ) -> None:
-        missing = [c for c in [reference_col] + prediction_cols + keep_cols if c not in self._data.columns]
+        missing = [
+            c for c in [reference_col] + prediction_cols + keep_cols
+            if c not in self._data.columns
+        ]
         if missing:
             raise ValueError(f"Columns not found in data: {missing}")
 
@@ -152,103 +160,39 @@ class TranslationEvaluator:
         return self._model_metrics.copy()
 
 
-
-
-
-
-# 1) Instantiate evaluator and load your data
-evaluator = TranslationEvaluator()
-evaluator.load_data("your_dev_file.xlsx")
-dev_texts = evaluator._data["es"].tolist()
-dev_refs  = evaluator._data["en"].tolist()
-
-# 2) Find best generation config
-result = evaluator.find_best_generation_config(
-    model      = your_finetuned_model,
-    tokenizer  = your_tokenizer,
-    dev_texts  = dev_texts,
-    dev_refs   = dev_refs,
-    device     = torch.device("cuda"),
-    max_length = 128
-)
-# result == {"best_cfg": {"num_beams":8, "length_penalty":0.8}, "best_bleu": 42.17}
-
-
-
-
-if score > best_bleu:
-    best_bleu = score
-    best_cfg  = {"num_beams": num_beams, "length_penalty": length_penalty}
-
-print("▶ Best generation config:", best_cfg, "→ BLEU:", best_bleu)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-#!/usr/bin/env python
-import os
-import sys
-import argparse
-
-from translation_evaluator import TranslationEvaluator
-
-def main(input_files, output_dir):
-    # 1) ensure we have at least one file
-    if not input_files:
-        print("► Error: no input files provided.  Please pass at least one .xlsx/.xls file.")
-        sys.exit(1)
-
-    # 2) make sure the output directory exists
-    os.makedirs(output_dir, exist_ok=True)
-
-    # 3) tell the evaluator where to write the Excel report
-    output_path = os.path.join(output_dir, "translation_metrics_report.xlsx")
-    evaluator = TranslationEvaluator(output_file=output_path)
-
-    # 4) load each file
-    for fp in input_files:
-        print(f"▶ Loading data from {fp}")
-        evaluator.load_data(fp)
-
-    # 5) run the metrics (customize cols if you like)
-    evaluator.evaluate(
-        prediction_cols = ["candidate"],
-        reference_col   = "reference",
-        metrics         = ["BLEU", "ChrF", "ChrF++"],
-        keep_cols       = ["es"]            # list any extra columns you want carried through
-    )
-
-    # 6) write out the Excel workbook
-    evaluator.generate_report()
-    print(f"\n✔ All done!  Report saved to:\n    {output_path}")
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="Run NLP Metric Calculator")
-    p.add_argument(
-        "--output_dir",
-        type=str,
-        required=True,
-        help="Directory where the generatedResults .xlsx will be saved"
+    parser = argparse.ArgumentParser(
+        description="Run BLE_CHF_CHP metrics with TranslationEvaluator"
     )
-    p.add_argument(
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        required=True,
+        help="Directory in which to write the Excel report"
+    )
+    parser.add_argument(
         "files",
         nargs="+",
-        help="One or more input Excel files (csv/xls/xlsx) to process"
+        help="One or more input .csv/.xls/.xlsx files to process"
     )
-    args = p.parse_args()
+    args = parser.parse_args()
 
-    print(f"→ Output directory: {args.output_dir}")
-    print(f"→ Input files:     {args.files}\n")
-    main(args.files, args.output_dir)
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / "BleuChrfscores_output.xlsx"
+
+    evaluator = TranslationEvaluator(output_file=output_path)
+
+    for f in args.files:
+        print(f"▶ Loading data from {f}")
+        evaluator.load_data(f)
+
+    evaluator.evaluate(
+        prediction_cols=["candidate"],
+        reference_col="reference",
+        metrics=["BLEU", "ChrF", "ChrF++"],
+        keep_cols=None
+    )
+    evaluator.generate_report()
+
+    print("✅ All done!")  # exit code 0
