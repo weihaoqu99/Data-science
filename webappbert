@@ -1,48 +1,100 @@
-# bertscore_cli.py
+#!/usr/bin/env python3
+import os
+import sys
+import argparse
+from pathlib import Path
+import warnings
 
-import sys, os, argparse, tempfile, pandas as pd
-from evaluate import load
-# … any other imports …
+import pandas as pd
+import evaluate
+import torch
 
 def main(input_files, output_dir):
+    # 1) sanity checks
+    if not input_files:
+        print("❌ Error: no input files provided. Pass at least one .xlsx/.xls file.")
+        sys.exit(1)
     os.makedirs(output_dir, exist_ok=True)
 
-    # load the metric
-    scorer = load("bertscore")
-    # read input
-    df = pd.read_excel(input_files[0])
-    # sanity check
-    for col in ("reference","candidate"):
-        if col not in df.columns:
-            raise ValueError(f"Excel must have '{col}' column")
+    # 2) load the BERTScore metric
+    warnings.simplefilter("ignore")
+    scorer = evaluate.load("bertscore")  # will pick up your local bertscore.py if you overrode
+    print("✅ Loaded local BERTScore metric")
 
-    # compute
-    out = scorer.compute(
-      predictions= df["candidate"].apply(str).tolist(),
-      references=  df["reference"].apply(str).tolist(),
-      model_type="roberta-large",   # or your MODEL_PATH
-      num_layers=17,
-      device="cuda",
-      rescale_with_baseline=True,
-      baseline_path="/path/to/roberta-large.tsv",
-      lang="en"
+    # 3) for each input file, compute scores and write a combined Excel
+    for fp in input_files:
+        fp = Path(fp)
+        print(f"🔄 Processing {fp}…")
+        # read in
+        try:
+            df = pd.read_excel(fp)
+        except Exception as e:
+            print(f"❌ Could not read Excel {fp}: {e}")
+            sys.exit(1)
+
+        # require columns
+        for col in ("reference", "candidate"):
+            if col not in df.columns:
+                print(f"❌ Excel {fp} must have a '{col}' column")
+                sys.exit(1)
+
+        # prepare lists
+        refs  = df["reference"].astype(str).str.strip().tolist()
+        cands = df["candidate"].astype(str).str.strip().tolist()
+
+        # compute
+        try:
+            out = scorer.compute(
+                predictions=cands,
+                references=refs,
+                model_type="roberta-large",                       # ← important
+                num_layers=17,
+                device="cuda" if torch.cuda.is_available() else "cpu",
+                rescale_with_baseline=True,
+                baseline_path=str(Path(__file__).parent / "roberta-large.tsv"),
+                lang="en",
+            )
+        except Exception as e:
+            print("❌ BERTScore compute failed:", e)
+            sys.exit(1)
+
+        # unpack into dataframe
+        df["precision"] = out["precision"]
+        df["recall"]    = out["recall"]
+        df["f1"]        = out["f1"]
+
+        # macro‐average
+        model_metrics = {
+            "Model": "roberta-large",
+            "Precision": sum(df["precision"]) / len(df["precision"]),
+            "Recall":    sum(df["recall"])    / len(df["recall"]),
+            "F1":        sum(df["f1"])        / len(df["f1"]),
+        }
+
+        # write to Excel
+        report_path = Path(output_dir) / "Bertscore_output.xlsx"
+        with pd.ExcelWriter(report_path, engine="xlsxwriter") as writer:
+            df.to_excel(writer, sheet_name="Detailed_metrics", index=False)
+            pd.DataFrame([model_metrics]).to_excel(
+                writer, sheet_name="Model_metrics", index=False
+            )
+
+        print(f"✅ Report saved to {report_path.resolve()}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Run BERTScore Metric Calculator"
     )
-    # put back in dataframe
-    df["precision"] = out["precision"]
-    df["recall"]    = out["recall"]
-    df["f1"]        = out["f1"]
+    parser.add_argument(
+        "--output_dir", type=str, required=True,
+        help="Directory where Bertscore_output.xlsx will be saved"
+    )
+    parser.add_argument(
+        "files", nargs="+",
+        help="One or more input Excel files (.xls/.xlsx)"
+    )
+    args = parser.parse_args()
 
-    # write exactly the same filename as in your JSON config
-    output_file = os.path.join(output_dir, "Bertscore_output.xlsx")
-    with pd.ExcelWriter(output_file, engine="xlsxwriter") as w:
-        df.to_excel(w, sheet_name="Detailed_metrics", index=False)
-        # maybe also write a model-summary sheet if your UI expects it
-        # ...
-    print(f"Wrote report to {output_file}")
-
-if __name__=="__main__":
-    p = argparse.ArgumentParser(description="Run BertScore batch")
-    p.add_argument("--output_dir", required=True)
-    p.add_argument("files", nargs="+", help="One or more input Excel files")
-    args = p.parse_args()
+    print(f"Output directory: {args.output_dir}")
+    print(f"Input files: {args.files}")
     main(args.files, args.output_dir)
