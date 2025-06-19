@@ -9,13 +9,13 @@ from typing import Union, List, Optional
 import pandas as pd
 from sacrebleu import sentence_bleu, sentence_chrf
 from sacrebleu.metrics import CHRF
-import evaluate  # picks up your local bertscore.py
+from bert_score import BERTScorer
+
 
 class TranslationEvaluator:
     """
     Load data
     Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1)
-      entirely offline using your local bertscore.py and model cache
     Compute macro-average model metrics
     Write Detailed + Model metrics to Excel
     """
@@ -25,31 +25,31 @@ class TranslationEvaluator:
         cache_dir: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large",
         baseline_tsv: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
     ):
-        # 1) Force offline and point Transformers cache at your local model
+        # Force transformers into offline mode and point cache locally
+        os.environ["TRANSFORMERS_CACHE"]   = cache_dir
         os.environ["TRANSFORMERS_OFFLINE"] = "1"
         os.environ["HF_HUB_OFFLINE"]       = "1"
-        os.environ["TRANSFORMERS_CACHE"]   = cache_dir
         warnings.simplefilter("ignore")
 
-        self._data             = None
+        self._data = None
         self._detailed_results = None
-        self._model_metrics    = None
-        self._output_file      = Path(output_file)
-        self._chrf             = CHRF(word_order=2)
+        self._model_metrics = None
+        self._output_file = Path(output_file)
+        self._chrf = CHRF(word_order=2)
 
-        # 2) Load your local bertscore.py metric
-        metric_path = Path(__file__).parent / "bertscore.py"
-        if not metric_path.exists():
-            print(f"ERROR: could not find local bertscore.py at {metric_path!r}", file=sys.stderr)
-            sys.exit(1)
+        # initialize local BERTScorer
         try:
-            self._bertscorer = evaluate.load(str(metric_path))
+            self._bertscorer = BERTScorer(
+                lang="en",
+                rescale_with_baseline=True,
+                model_type="roberta-large",
+                baseline_path=baseline_tsv,
+                num_layers=24,
+                device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
+            )
         except Exception as e:
-            print("ERROR: failed to load local bertscore metric:", e, file=sys.stderr)
+            print("ERROR: failed to init BERTScorer:", e, file=sys.stderr)
             sys.exit(1)
-
-        # 3) Store baseline path (evaluate.load will pick it up via env if needed)
-        os.environ["BASELINE"] = baseline_tsv
 
     def load_data(self, file_path: Union[str, Path]) -> None:
         fp = Path(file_path)
@@ -69,6 +69,7 @@ class TranslationEvaluator:
     ) -> None:
         if self._data is None:
             raise ValueError("No data loaded. Call load_data() first.")
+
         keep = keep_cols or []
         if reference_col not in keep:
             keep.insert(0, reference_col)
@@ -117,25 +118,16 @@ class TranslationEvaluator:
                     axis=1
                 )
 
-        # BERTScore via local evaluate metric
+        # BERTScore
         if "BERTScore" in metrics:
             preds = df[prediction_cols[0]].tolist()
             refs  = [[r] for r in df[reference_col].tolist()]
-            out   = self._bertscorer.compute(
-                predictions=preds,
-                references=refs,
-                model_type=os.environ["BERT"],
-                num_layers=24,
-                device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu",
-                rescale_with_baseline=True,
-                baseline_path=os.environ["BASELINE"],
-                lang="en"
-            )
-            df[f"{prediction_cols[0]} BERT-P"]  = out["precision"]
-            df[f"{prediction_cols[0]} BERT-R"]  = out["recall"]
-            df[f"{prediction_cols[0]} BERT-F1"] = out["f1"]
+            P, R, F1 = self._bertscorer.score(preds, refs)
+            df[f"{prediction_cols[0]} BERT-P"]  = P.tolist()
+            df[f"{prediction_cols[0]} BERT-R"]  = R.tolist()
+            df[f"{prediction_cols[0]} BERT-F1"] = F1.tolist()
 
-        # select columns
+        # build column order
         cols = keep.copy()
         for p in prediction_cols:
             cols.append(p)
@@ -162,10 +154,11 @@ class TranslationEvaluator:
             if "ChrF++" in metrics:
                 row["ChrF++"] = self._detailed_results[f"{p} ChrF++"].mean()
             if "BERTScore" in metrics:
-                row["BERT-P"]  = pd.Series(self._detailed_results[f"{p} BERT-P"]).mean()
-                row["BERT-R"]  = pd.Series(self._detailed_results[f"{p} BERT-R"]).mean()
-                row["BERT-F1"] = pd.Series(self._detailed_results[f"{p} BERT-F1"]).mean()
+                row["BERT-P"]  = self._detailed_results[f"{p} BERT-P"].mean()
+                row["BERT-R"]  = self._detailed_results[f"{p} BERT-R"].mean()
+                row["BERT-F1"] = self._detailed_results[f"{p} BERT-F1"].mean()
             rows.append(row)
+
         self._model_metrics = pd.DataFrame(rows)
 
     def generate_report(self) -> None:
@@ -181,7 +174,7 @@ class TranslationEvaluator:
                 "style": "Table Style Medium 9",
                 "name": "ModelMetrics"
             })
-            # auto-fit
+            # auto-fit columns
             for idx, col in enumerate(self._model_metrics.columns):
                 width = max(self._model_metrics[col].astype(str).map(len).max(), len(col)) + 2
                 ws.set_column(idx, idx, width)
@@ -190,27 +183,24 @@ class TranslationEvaluator:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run metrics with TranslationEvaluator")
+    parser = argparse.ArgumentParser(description="Run all metrics with TranslationEvaluator")
     parser.add_argument(
-        "--output_dir",
-        type=Path,
-        required=True,
-        help="Directory to write Excel report"
+        "--output_dir", type=Path, required=True,
+        help="Directory in which to write the Excel report"
     )
     parser.add_argument(
-        "files",
-        nargs="+",
-        help="Input .csv/.xls/.xlsx files"
+        "files", nargs="+",
+        help="One or more .csv/.xls/.xlsx files to process"
     )
     args = parser.parse_args()
 
-    out_dir   = args.output_dir
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_fp = out_dir / "Metrics_output.xlsx"
+    output_path = out_dir / "Metrics_output.xlsx"
 
-    evaluator = TranslationEvaluator(output_file=output_fp)
+    evaluator = TranslationEvaluator(output_file=output_path)
     for f in args.files:
-        print(f"▶ Loading {f}")
+        print(f"▶ Loading data from {f}")
         evaluator.load_data(f)
 
     evaluator.evaluate(
