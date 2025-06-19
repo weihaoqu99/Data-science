@@ -5,18 +5,14 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-from bert_score import BERTScorer
-
-# ─── Monkey-patch HF repo-id validator so Windows paths aren’t rejected ─────
-try:
-    import huggingface_hub.utils.validators as _val
-    _val.validate_repo_id = lambda *a, **k: None
-except ImportError:
-    pass
-# ─────────────────────────────────────────────────────────────────────────────
+import torch
+import torch.nn.functional as F
+from transformers import RobertaTokenizer, RobertaModel
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute BERTScore offline")
+    parser = argparse.ArgumentParser(
+        description="Compute BERTScore offline with local RoBERTa-large"
+    )
     parser.add_argument(
         "--output_dir",
         type=Path,
@@ -26,34 +22,34 @@ def main():
     parser.add_argument(
         "files",
         nargs="+",
-        help="Input .csv/.xls/.xlsx files with 'reference' & 'candidate' columns"
+        help="One or more .csv/.xls/.xlsx files with 'reference' & 'candidate' columns"
     )
     args = parser.parse_args()
 
-    # 1) your local model & baseline paths
-    cache_dir     = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-    baseline_path = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv")
-
-    # 2) force offline & point cache
-    os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    os.environ["HF_HUB_OFFLINE"]       = "1"
-    os.environ["TRANSFORMERS_CACHE"]   = str(cache_dir)
-
-    # 3) init BERTScorer from your local folder only
-    try:
-        scorer = BERTScorer(
-            lang="en",
-            rescale_with_baseline=True,
-            model_type=str(cache_dir),      # pass the local path
-            baseline_path=str(baseline_path),
-            num_layers=24,
-            device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
-        )
-    except Exception as e:
-        print("ERROR: failed to init BERTScorer:", e, file=sys.stderr)
+    # ─── Setup local model cache (no Hub) ────────────────────────────────────
+    MODEL_DIR = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
+    if not MODEL_DIR.is_dir():
+        print(f"ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
         sys.exit(1)
 
-    # 4) read & concatenate all input files
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        tokenizer = RobertaTokenizer.from_pretrained(
+            str(MODEL_DIR),
+            local_files_only=True,
+            use_fast=False
+        )
+        model = RobertaModel.from_pretrained(
+            str(MODEL_DIR),
+            local_files_only=True
+        ).to(device).eval()
+    except Exception as e:
+        print("ERROR: loading local RoBERTa-large model/tokenizer failed:", e, file=sys.stderr)
+        sys.exit(1)
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ─── Read & concatenate all inputs ──────────────────────────────────────
     dfs = []
     for fn in args.files:
         p = Path(fn)
@@ -64,32 +60,53 @@ def main():
         else:
             print(f"ERROR: unsupported file type {p.suffix}", file=sys.stderr)
             sys.exit(1)
+    if not dfs:
+        print("ERROR: no data loaded", file=sys.stderr)
+        sys.exit(1)
     df = pd.concat(dfs, ignore_index=True)
+    # ────────────────────────────────────────────────────────────────────────
 
-    # 5) ensure required columns exist
+    # ─── Verify required columns ────────────────────────────────────────────
     for col in ("reference", "candidate"):
         if col not in df.columns:
-            print(f"ERROR: missing column '{col}'", file=sys.stderr)
+            print(f"ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
+    # ────────────────────────────────────────────────────────────────────────
 
-    # 6) compute BERTScore (precision, recall, f1)
-    P, R, F1 = scorer.score(
-        cands=df["candidate"].astype(str).tolist(),
-        refs=[[r] for r in df["reference"].astype(str).tolist()]
-    )
-    df["precision"] = [round(x, 6) for x in P.tolist()]
-    df["recall"]    = [round(x, 6) for x in R.tolist()]
-    df["f1"]        = [round(x, 6) for x in F1.tolist()]
+    # ─── Compute BERTScore sentence by sentence ─────────────────────────────
+    precisions, recalls, f1s = [], [], []
+    for cand, ref in zip(df["candidate"].astype(str), df["reference"].astype(str)):
+        # tokenize
+        ec = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512).to(device)
+        er = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512).to(device)
+        # embed
+        with torch.no_grad():
+            oc = model(**ec).last_hidden_state.squeeze(0)   # [T1,d]
+            or_ = model(**er).last_hidden_state.squeeze(0)  # [T2,d]
+        # normalize & similarity
+        nc = F.normalize(oc,  dim=1)  # [T1,d]
+        nr = F.normalize(or_, dim=1)  # [T2,d]
+        sim = nc @ nr.T               # [T1,T2]
+        p = sim.max(dim=1).values.mean().item()
+        r = sim.max(dim=0).values.mean().item()
+        f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
-    # 7) write out the result Excel
-    out_dir   = args.output_dir
+        precisions.append(round(p, 6))
+        recalls.append(round(r, 6))
+        f1s.append(round(f, 6))
+    # ────────────────────────────────────────────────────────────────────────
+
+    # ─── Attach scores & write out ─────────────────────────────────────────
+    df["precision"] = precisions
+    df["recall"]    = recalls
+    df["f1"]        = f1s
+
+    out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_fp = out_dir / "Bertscore_output.xlsx"
-    df.to_excel(output_fp, index=False)
+    out_fp = out_dir / "Bertscore_output.xlsx"
+    df.to_excel(out_fp, index=False)
 
-    # 8) final success message
-    print(f"✔️ Report saved to: {output_fp.resolve()}")
+    print(f"✔️  Report saved to: {out_fp.resolve()}")
 
 if __name__ == "__main__":
     main()
-    
