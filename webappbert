@@ -9,36 +9,43 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoModel
 
+# ─── FORCE OFFLINE & SET PATHS ─────────────────────────────────────────────────
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+MODEL_PATH    = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
+BASELINE_PATH = Path(
+    "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
+)
+DEVICE = torch.device("cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
+# ────────────────────────────────────────────────────────────────────────────────
+
 def main():
-    parser = argparse.ArgumentParser(description="Run BERTScore metrics")
-    parser.add_argument(
-        "files", nargs="+",
-        help="One or more input .xls/.xlsx/.csv files with 'reference' and 'candidate' columns"
-    )
+    parser = argparse.ArgumentParser(description="Compute BERTScore metrics offline")
     parser.add_argument(
         "--output_dir",
         type=Path,
         required=True,
         help="Directory in which to write Bertscore_output.xlsx"
     )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        help="One or more input .xls/.xlsx/.csv files with 'reference' & 'candidate' columns"
+    )
     args = parser.parse_args()
 
-    # ─── Your exact local model & baseline paths ────────────────────────────────
-    MODEL_PATH    = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-    BASELINE_PATH = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv")
-    # Use GPU if CUDA_VISIBLE_DEVICES is set, else CPU
-    device = torch.device("cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
-    # ────────────────────────────────────────────────────────────────────────────────
+    # 1) Load tokenizer & model from your local cache
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
+        model     = AutoModel.from_pretrained(MODEL_PATH, local_files_only=True).to(DEVICE)
+        model.eval()
+    except Exception as e:
+        print(f"ERROR: could not load model/tokenizer from {MODEL_PATH}:", e, file=sys.stderr)
+        sys.exit(1)
 
-    # Load tokenizer & model from your offline cache
-    tokenizer = AutoTokenizer.from_pretrained(str(MODEL_PATH), local_files_only=True)
-    model     = AutoModel.from_pretrained(str(MODEL_PATH), local_files_only=True).to(device)
-    model.eval()
-
-    # Read and concatenate all input files
+    # 2) Read & concatenate all input files
     dfs = []
-    for fn in args.files:
-        p = Path(fn)
+    for fp in args.files:
+        p = Path(fp)
         if not p.exists():
             print(f"ERROR: file not found: {p}", file=sys.stderr)
             sys.exit(1)
@@ -56,13 +63,14 @@ def main():
         sys.exit(1)
 
     df = pd.concat(dfs, ignore_index=True)
-    # Validate columns
+
+    # 3) Validate required columns
     for col in ("reference", "candidate"):
         if col not in df.columns:
             print(f"ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # Compute sentence‐level embeddings & BERTScore
+    # 4) Compute sentence‐level BERTScore
     precisions, recalls, f1s = [], [], []
     for _, row in df.iterrows():
         cand = str(row["candidate"])
@@ -70,33 +78,32 @@ def main():
         enc_c = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512)
         enc_r = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512)
         with torch.no_grad():
-            out_c = model(**{k: v.to(device) for k, v in enc_c.items()})
-            out_r = model(**{k: v.to(device) for k, v in enc_r.items()})
-        emb_c = F.normalize(out_c.last_hidden_state.squeeze(0), dim=1)  # (len_c, d)
-        emb_r = F.normalize(out_r.last_hidden_state.squeeze(0), dim=1)  # (len_r, d)
-        sim = emb_c @ emb_r.T
-        p = sim.max(dim=1).values.mean().item()
-        r = sim.max(dim=0).values.mean().item()
-        f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            out_c = model(**{k: v.to(DEVICE) for k, v in enc_c.items()})
+            out_r = model(**{k: v.to(DEVICE) for k, v in enc_r.items()})
+        emb_c = F.normalize(out_c.last_hidden_state.squeeze(0), dim=1)
+        emb_r = F.normalize(out_r.last_hidden_state.squeeze(0), dim=1)
+        sim   = emb_c @ emb_r.T
+        p     = sim.max(dim=1).values.mean().item()
+        r     = sim.max(dim=0).values.mean().item()
+        f     = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
         precisions.append(p)
         recalls.append(r)
         f1s.append(f)
 
-    # Attach scores to DataFrame
+    # 5) Attach scores to DataFrame
     df["precision"] = [round(min(max(x, 0.0), 1.0), 6) for x in precisions]
     df["recall"]    = [round(min(max(x, 0.0), 1.0), 6) for x in recalls]
     df["f1"]        = [round(min(max(x, 0.0), 1.0), 6) for x in f1s]
 
-    # Write out the Excel
+    # 6) Write out the Excel (Model metrics sheet only)
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_fp = out_dir / "Bertscore_output.xlsx"
-    df.to_excel(out_fp, index=False)
+    output_fp = out_dir / "Bertscore_output.xlsx"
+    df.to_excel(output_fp, index=False)
 
-    # Single line of stdout so Flask sees success
-    print(f"✔️ Report saved to: {out_fp.resolve()}")
+    # 7) One stdout line for Flask to detect success
+    print(f"✔️ Report saved to: {output_fp.resolve()}")
 
 if __name__ == "__main__":
     main()
-    
