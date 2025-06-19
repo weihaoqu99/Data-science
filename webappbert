@@ -2,113 +2,216 @@
 import os
 import sys
 import argparse
+import warnings
 from pathlib import Path
+from typing import Union, List, Optional
 
 import pandas as pd
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+from sacrebleu import sentence_bleu, sentence_chrf
+from sacrebleu.metrics import CHRF
 
-# ─── 0) PATCH OUT HF VALIDATION & FORCE OFFLINE ────────────────────────────────
+# ─── Monkey‐patch HF repo-id validator so Windows paths aren’t rejected ───────
+for module_name in ("huggingface_hub.utils.validators", "huggingface_hub.utils._validators"):
+    try:
+        mod = __import__(module_name, fromlist=["validate_repo_id"])
+        setattr(mod, "validate_repo_id", lambda *a, **k: None)
+    except ImportError:
+        pass
+# ────────────────────────────────────────────────────────────────────────────────
+
+# Force offline mode and point HF cache at your local model folder
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"]       = "1"
+os.environ["TRANSFORMERS_CACHE"]   = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
 
-# Monkey‐patch the hub validator so Windows paths aren’t treated as repo IDs
-try:
-    import huggingface_hub.utils.validators as _validators
-    _validators.validate_repo_id = lambda *args, **kwargs: None
-except ImportError:
-    pass
-# ────────────────────────────────────────────────────────────────────────────────
+from bert_score import BERTScorer
 
-# ─── 1) Your exact local model + baseline paths ───────────────────────────────
-MODEL_PATH    = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-BASELINE_PATH = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv")
-DEVICE        = torch.device("cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
-# ────────────────────────────────────────────────────────────────────────────────
 
-def main():
-    # ─── 2) CLI parsing ─────────────────────────────────────────────────────────
-    parser = argparse.ArgumentParser(description="Compute BERTScore metrics offline")
+class TranslationEvaluator:
+    """
+    Load data
+    Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1)
+    Compute macro-average model metrics
+    Write Detailed + Model metrics to Excel
+    """
+    def __init__(
+        self,
+        output_file: Union[str, Path] = "Metrics_output.xlsx",
+        baseline_tsv: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
+    ):
+        warnings.simplefilter("ignore")
+        self._data             = None
+        self._detailed_results = None
+        self._model_metrics    = None
+        self._output_file      = Path(output_file)
+        self._chrf             = CHRF(word_order=2)
+
+        # init BERTScorer with local cache + baseline TSV
+        try:
+            self._bertscorer = BERTScorer(
+                lang="en",
+                rescale_with_baseline=True,
+                model_type="roberta-large",      # valid HF name
+                baseline_path=baseline_tsv,
+                num_layers=24,                   # roberta-large
+                device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
+            )
+        except Exception as e:
+            print("ERROR: failed to init BERTScorer:", e, file=sys.stderr)
+            sys.exit(1)
+
+    def load_data(self, file_path: Union[str, Path]) -> None:
+        fp = Path(file_path)
+        if fp.suffix == ".csv":
+            self._data = pd.read_csv(fp)
+        elif fp.suffix in (".xls", ".xlsx"):
+            self._data = pd.read_excel(fp)
+        else:
+            raise ValueError(f"Unsupported file type: {fp.suffix}")
+
+    def evaluate(
+        self,
+        prediction_cols: List[str] = ["candidate"],
+        reference_col: str = "reference",
+        metrics: List[str] = ["BLEU", "ChrF", "ChrF++", "BERTScore"],
+        keep_cols: Optional[List[str]] = None
+    ) -> None:
+        if self._data is None:
+            raise ValueError("No data loaded. Call load_data() first.")
+        keep = keep_cols or []
+        if reference_col not in keep:
+            keep.insert(0, reference_col)
+
+        self._validate_columns(reference_col, prediction_cols, keep)
+        self._compute_detailed_metrics(reference_col, prediction_cols, metrics, keep)
+        self._compute_model_metrics(metrics, prediction_cols)
+
+    def _validate_columns(
+        self, reference_col: str, prediction_cols: List[str], keep_cols: List[str]
+    ) -> None:
+        missing = [c for c in [reference_col] + prediction_cols + keep_cols
+                   if c not in self._data.columns]
+        if missing:
+            raise ValueError(f"Columns not found in data: {missing}")
+
+    def _compute_detailed_metrics(
+        self, reference_col: str, prediction_cols: List[str],
+        metrics: List[str], keep_cols: List[str]
+    ) -> None:
+        df = self._data.copy().astype(str)
+
+        # BLEU / ChrF / ChrF++
+        for p in prediction_cols:
+            if "BLEU" in metrics:
+                df[f"{p} BLEU"] = df.apply(
+                    lambda r: sentence_bleu(r[p], references=[r[reference_col]]).score,
+                    axis=1
+                )
+            if "ChrF" in metrics:
+                df[f"{p} ChrF"] = df.apply(
+                    lambda r: sentence_chrf(r[p], references=[r[reference_col]]).score,
+                    axis=1
+                )
+            if "ChrF++" in metrics:
+                df[f"{p} ChrF++"] = df.apply(
+                    lambda r: self._chrf.sentence_score(r[p], references=[r[reference_col]]).score,
+                    axis=1
+                )
+
+        # BERTScore
+        if "BERTScore" in metrics:
+            preds = []
+            refs  = []
+            for _, row in df.iterrows():
+                preds.append(row[prediction_cols[0]])
+                refs.append([row[reference_col]])
+            P, R, F1 = self._bertscorer.score(preds, refs)
+            df[f"{prediction_cols[0]} BERT-P"]  = P.tolist()
+            df[f"{prediction_cols[0]} BERT-R"]  = R.tolist()
+            df[f"{prediction_cols[0]} BERT-F1"] = F1.tolist()
+
+        # select columns
+        cols = keep.copy()
+        for p in prediction_cols:
+            cols.append(p)
+            if "BLEU" in metrics:
+                cols.append(f"{p} BLEU")
+            if "ChrF" in metrics:
+                cols.append(f"{p} ChrF")
+            if "ChrF++" in metrics:
+                cols.append(f"{p} ChrF++")
+            if "BERTScore" in metrics:
+                cols += [f"{p} BERT-P", f"{p} BERT-R", f"{p} BERT-F1"]
+
+        self._detailed_results = df[cols]
+
+    def _compute_model_metrics(
+        self, metrics: List[str], prediction_cols: List[str]
+    ) -> None:
+        rows = []
+        for p in prediction_cols:
+            row = {"Model": p}
+            if "BLEU" in metrics:
+                row["BLEU"]    = self._detailed_results[f"{p} BLEU"].mean()
+            if "ChrF" in metrics:
+                row["ChrF"]    = self._detailed_results[f"{p} ChrF"].mean()
+            if "ChrF++" in metrics:
+                row["ChrF++"]  = self._detailed_results[f"{p} ChrF++"].mean()
+            if "BERTScore" in metrics:
+                row["BERT-P"]  = self._detailed_results[f"{p} BERT-P"].mean()
+                row["BERT-R"]  = self._detailed_results[f"{p} BERT-R"].mean()
+                row["BERT-F1"] = self._detailed_results[f"{p} BERT-F1"].mean()
+            rows.append(row)
+        self._model_metrics = pd.DataFrame(rows)
+
+    def generate_report(self) -> None:
+        self._output_file.parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(self._output_file, engine="xlsxwriter") as writer:
+            self._detailed_results.to_excel(writer, sheet_name="Detailed metrics", index=False)
+            self._model_metrics.to_excel(writer, sheet_name="Model metrics", index=False)
+            wb = writer.book
+            ws = writer.sheets["Model metrics"]
+            max_row, max_col = self._model_metrics.shape
+            headers = [{"header": c} for c in self._model_metrics.columns]
+            ws.add_table(0, 0, max_row, max_col - 1, {
+                "columns": headers,
+                "style": "Table Style Medium 9",
+                "name": "ModelMetrics"
+            })
+            # auto‐fit
+            for idx, col in enumerate(self._model_metrics.columns):
+                w = max(self._model_metrics[col].astype(str).map(len).max(), len(col)) + 2
+                ws.set_column(idx, idx, w)
+
+        print(f"Report saved to: {self._output_file.resolve()}")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run metrics with TranslationEvaluator")
     parser.add_argument(
         "--output_dir", type=Path, required=True,
-        help="Directory to write Bertscore_output.xlsx"
+        help="Directory to write Excel report"
     )
     parser.add_argument(
         "files", nargs="+",
-        help="One or more .xls/.xlsx/.csv files with 'reference' & 'candidate' columns"
+        help="Input .csv/.xls/.xlsx files"
     )
     args = parser.parse_args()
-    # ────────────────────────────────────────────────────────────────────────────────
-
-    # ─── 3) Load tokenizer & model from local disk ───────────────────────────────
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
-        model     = AutoModel.from_pretrained(MODEL_PATH,   local_files_only=True).to(DEVICE)
-        model.eval()
-    except Exception as e:
-        print(f"ERROR: loading model/tokenizer from {MODEL_PATH!r} failed:", e, file=sys.stderr)
-        sys.exit(1)
-    # ────────────────────────────────────────────────────────────────────────────────
-
-    # ─── 4) Read + concat input files ──────────────────────────────────────────────
-    dfs = []
-    for fn in args.files:
-        p = Path(fn)
-        if not p.exists():
-            print(f"ERROR: file not found: {p}", file=sys.stderr); sys.exit(1)
-        if p.suffix.lower() in (".xls", ".xlsx"):
-            dfs.append(pd.read_excel(p))
-        elif p.suffix.lower() == ".csv":
-            dfs.append(pd.read_csv(p))
-        else:
-            print(f"ERROR: unsupported file type {p.suffix}", file=sys.stderr); sys.exit(1)
-    if not dfs:
-        print("ERROR: no data loaded", file=sys.stderr); sys.exit(1)
-    df = pd.concat(dfs, ignore_index=True)
-    # ────────────────────────────────────────────────────────────────────────────────
-
-    # ─── 5) Validate columns ──────────────────────────────────────────────────────
-    for col in ("reference", "candidate"):
-        if col not in df.columns:
-            print(f"ERROR: missing required column '{col}'", file=sys.stderr)
-            sys.exit(1)
-    # ────────────────────────────────────────────────────────────────────────────────
-
-    # ─── 6) Compute sentence-level BERTScore ──────────────────────────────────────
-    precisions, recalls, f1s = [], [], []
-    for _, row in df.iterrows():
-        cand, ref = str(row["candidate"]), str(row["reference"])
-        ec = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512)
-        er = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            oc = model(**{k: v.to(DEVICE) for k, v in ec.items()})
-            or_ = model(**{k: v.to(DEVICE) for k, v in er.items()})
-        emb_c = F.normalize(oc.last_hidden_state.squeeze(0), dim=1)
-        emb_r = F.normalize(or_.last_hidden_state.squeeze(0), dim=1)
-        sim   = emb_c @ emb_r.T
-        p     = sim.max(dim=1).values.mean().item()
-        r     = sim.max(dim=0).values.mean().item()
-        f     = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-
-        precisions.append(p)
-        recalls.append(r)
-        f1s.append(f)
-    # ────────────────────────────────────────────────────────────────────────────────
-
-    # ─── 7) Attach scores & write Excel ───────────────────────────────────────────
-    df["precision"] = [round(min(max(x, 0.0), 1.0), 6) for x in precisions]
-    df["recall"]    = [round(min(max(x, 0.0), 1.0), 6) for x in recalls]
-    df["f1"]        = [round(min(max(x, 0.0), 1.0), 6) for x in f1s]
 
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_fp = out_dir / "Bertscore_output.xlsx"
-    df.to_excel(output_fp, index=False)
-    # ────────────────────────────────────────────────────────────────────────────────
+    output_fp = out_dir / "Metrics_output.xlsx"
 
-    # ─── 8) Success line ──────────────────────────────────────────────────────────
-    print(f"✔️ Report saved to: {output_fp.resolve()}")
+    evaluator = TranslationEvaluator(output_file=output_fp)
+    for f in args.files:
+        print(f"▶ Loading {f}")
+        evaluator.load_data(f)
 
-if __name__ == "__main__":
-    main()
+    evaluator.evaluate(
+        prediction_cols=["candidate"],
+        reference_col="reference",
+        metrics=["BLEU", "ChrF", "ChrF++", "BERTScore"],
+        keep_cols=None
+    )
+    evaluator.generate_report()
+    print("✅ All done!")
