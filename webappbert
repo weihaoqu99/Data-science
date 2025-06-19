@@ -8,13 +8,13 @@ from typing import Union, List, Optional
 import pandas as pd
 from sacrebleu import sentence_bleu, sentence_chrf
 from sacrebleu.metrics import CHRF
-import evaluate  # picks up your local bertscore.py metric
+import evaluate  # pip install evaluate
 
 class TranslationEvaluator:
     """
     Load data
-    Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1) via your local evaluate metric
-    Compute macro-average model metrics
+    Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1)
+    via a local bertscore.py metric
     Write Detailed + Model metrics to Excel
     """
     def __init__(
@@ -23,20 +23,28 @@ class TranslationEvaluator:
         model_path: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large",
         baseline_tsv: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
     ):
-        # point evaluate/BERTScore to your local cache & baseline
+        # Point BERTScore metric at your local cache & baseline:
         os.environ["BERT"]     = model_path
         os.environ["BASELINE"] = baseline_tsv
-        warnings.simplefilter("ignore")
+        # Avoid HF Hub entirely
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+        os.environ["HF_HUB_OFFLINE"]       = "1"
 
+        warnings.simplefilter("ignore")
         self._data             = None
         self._detailed_results = None
         self._model_metrics    = None
         self._output_file      = Path(output_file)
         self._chrf             = CHRF(word_order=2)
 
-        # load your local bertscore metric
+        # Load your **local** bertscore metric by path:
+        metric_path = Path(__file__).parent / "Automation_Scripts" / "bertscore.py"
+        if not metric_path.exists():
+            print(f"ERROR: could not find local bertscore.py at {metric_path}", file=sys.stderr)
+            sys.exit(1)
+
         try:
-            self._bertscorer = evaluate.load("bertscore")
+            self._bertscorer = evaluate.load(str(metric_path))
         except Exception as e:
             print("ERROR: failed to load local bertscore metric:", e, file=sys.stderr)
             sys.exit(1)
@@ -93,21 +101,21 @@ class TranslationEvaluator:
         for p in prediction_cols:
             if "BLEU" in metrics:
                 df[f"{p} BLEU"] = df.apply(
-                    lambda r: sentence_bleu(r[p], references=[r[reference_col]]).score,
+                    lambda r: sentence_bleu(r[p], [r[reference_col]]).score,
                     axis=1
                 )
             if "ChrF" in metrics:
                 df[f"{p} ChrF"] = df.apply(
-                    lambda r: sentence_chrf(r[p], references=[r[reference_col]]).score,
+                    lambda r: sentence_chrf(r[p], [r[reference_col]]).score,
                     axis=1
                 )
             if "ChrF++" in metrics:
                 df[f"{p} ChrF++"] = df.apply(
-                    lambda r: self._chrf.sentence_score(r[p], references=[r[reference_col]]).score,
+                    lambda r: self._chrf.sentence_score(r[p], [r[reference_col]]).score,
                     axis=1
                 )
 
-        # BERTScore via your local evaluate metric
+        # BERTScore via local metric
         if "BERTScore" in metrics:
             preds = df[prediction_cols[0]].tolist()
             refs  = [[r] for r in df[reference_col].tolist()]
@@ -125,7 +133,7 @@ class TranslationEvaluator:
             df[f"{prediction_cols[0]} BERT-R"]  = out["recall"]
             df[f"{prediction_cols[0]} BERT-F1"] = out["f1"]
 
-        # select detailed columns
+        # collect columns
         cols = keep.copy()
         for p in prediction_cols:
             cols.append(p)
@@ -145,9 +153,12 @@ class TranslationEvaluator:
         rows = []
         for p in prediction_cols:
             row = {"Model": p}
-            if "BLEU" in metrics:    row["BLEU"]    = self._detailed_results[f"{p} BLEU"].mean()
-            if "ChrF" in metrics:    row["ChrF"]    = self._detailed_results[f"{p} ChrF"].mean()
-            if "ChrF++" in metrics:  row["ChrF++"]  = self._detailed_results[f"{p} ChrF++"].mean()
+            if "BLEU" in metrics:
+                row["BLEU"]   = self._detailed_results[f"{p} BLEU"].mean()
+            if "ChrF" in metrics:
+                row["ChrF"]   = self._detailed_results[f"{p} ChrF"].mean()
+            if "ChrF++" in metrics:
+                row["ChrF++"] = self._detailed_results[f"{p} ChrF++"].mean()
             if "BERTScore" in metrics:
                 row["BERT-P"]  = pd.Series(self._detailed_results[f"{p} BERT-P"]).mean()
                 row["BERT-R"]  = pd.Series(self._detailed_results[f"{p} BERT-R"]).mean()
@@ -169,31 +180,27 @@ class TranslationEvaluator:
                 "style": "Table Style Medium 9",
                 "name": "ModelMetrics"
             })
-            # auto‐fit
             for idx, col in enumerate(self._model_metrics.columns):
                 width = max(self._model_metrics[col].astype(str).map(len).max(), len(col)) + 2
                 ws.set_column(idx, idx, width)
 
         print(f"Report saved to: {self._output_file.resolve()}")
 
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run metrics with TranslationEvaluator")
     parser.add_argument(
-        "--output_dir",
-        type=Path,
-        required=True,
+        "--output_dir", type=Path, required=True,
         help="Directory to write Excel report"
     )
     parser.add_argument(
-        "files",
-        nargs="+",
-        help="Input .csv/.xls/.xlsx files"
+        "files", nargs="+", help="Input .csv/.xls/.xlsx files"
     )
     args = parser.parse_args()
 
-    out_dir = args.output_dir
+    out_dir    = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_fp = out_dir / "Metrics_output.xlsx"
+    output_fp  = out_dir / "Metrics_output.xlsx"
 
     evaluator = TranslationEvaluator(output_file=output_fp)
     for f in args.files:
