@@ -5,102 +5,83 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
-
-# ─── FORCE OFFLINE & DEFINE PATHS AS Path OBJECTS ──────────────────────────────
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-MODEL_PATH    = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-BASELINE_PATH = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv")
-DEVICE        = torch.device("cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu")
-# ────────────────────────────────────────────────────────────────────────────────
+from bert_score import BERTScorer
 
 def main():
-    parser = argparse.ArgumentParser(description="Compute BERTScore metrics offline")
+    # 1) Parse CLI exactly like your other scripts
+    parser = argparse.ArgumentParser(description="Compute BERTScore metrics")
     parser.add_argument(
-        "--output_dir", type=Path, required=True,
+        "--output_dir",
+        type=Path,
+        required=True,
         help="Directory in which to write Bertscore_output.xlsx"
     )
     parser.add_argument(
-        "files", nargs="+",
+        "files",
+        nargs="+",
         help="One or more .xls/.xlsx/.csv files with 'reference' & 'candidate' columns"
     )
     args = parser.parse_args()
 
-    # ─── 1) LOAD TOKENIZER & MODEL FROM DISK ─────────────────────────────────────
+    # 2) Load the scorer for roberta-large (this is a valid repo_id)
+    #    It will pull from your local cache if you have it, or download if you have internet.
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_PATH, 
-            local_files_only=True
+        scorer = BERTScorer(
+            lang="en",
+            rescale_with_baseline=True,
+            model_type="roberta-large",   # use the standard ID, not a Windows path
+            num_layers=24,                # roberta-large has 24 layers
+            device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
         )
-        model = AutoModel.from_pretrained(
-            MODEL_PATH, 
-            local_files_only=True
-        ).to(DEVICE)
-        model.eval()
     except Exception as e:
-        print(f"ERROR: could not load model/tokenizer from {MODEL_PATH!r}:", e, file=sys.stderr)
+        print("ERROR: could not initialize BERTScorer('roberta-large'):", e, file=sys.stderr)
         sys.exit(1)
-    # ────────────────────────────────────────────────────────────────────────────────
 
-    # ─── 2) READ & CONCAT INPUT FILES ────────────────────────────────────────────
+    # 3) Read & concatenate all input files
     dfs = []
     for fn in args.files:
         p = Path(fn)
         if not p.exists():
-            print(f"ERROR: file not found: {p}", file=sys.stderr); sys.exit(1)
+            print(f"ERROR: file not found: {p}", file=sys.stderr)
+            sys.exit(1)
         ext = p.suffix.lower()
         if ext in (".xls", ".xlsx"):
             dfs.append(pd.read_excel(p))
         elif ext == ".csv":
             dfs.append(pd.read_csv(p))
         else:
-            print(f"ERROR: unsupported file type: {ext}", file=sys.stderr); sys.exit(1)
-    if not dfs:
-        print("ERROR: no data loaded", file=sys.stderr); sys.exit(1)
-    df = pd.concat(dfs, ignore_index=True)
-    # ────────────────────────────────────────────────────────────────────────────────
+            print(f"ERROR: unsupported file type: {ext}", file=sys.stderr)
+            sys.exit(1)
 
-    # ─── 3) VALIDATE REQUIRED COLUMNS ────────────────────────────────────────────
+    if not dfs:
+        print("ERROR: no data loaded", file=sys.stderr)
+        sys.exit(1)
+    df = pd.concat(dfs, ignore_index=True)
+
+    # 4) Validate required columns
     for col in ("reference", "candidate"):
         if col not in df.columns:
             print(f"ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
-    # ────────────────────────────────────────────────────────────────────────────────
 
-    # ─── 4) COMPUTE SENTENCE‐LEVEL BERTSCORE ─────────────────────────────────────
-    ps, rs, fs = [], [], []
-    for _, row in df.iterrows():
-        cand, ref = str(row["candidate"]), str(row["reference"])
-        ec = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512)
-        er = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            oc = model(**{k:v.to(DEVICE) for k,v in ec.items()})
-            or_ = model(**{k:v.to(DEVICE) for k,v in er.items()})
-        emb_c = F.normalize(oc.last_hidden_state.squeeze(0), dim=1)
-        emb_r = F.normalize(or_.last_hidden_state.squeeze(0), dim=1)
-        sim   = emb_c @ emb_r.T
-        p     = sim.max(dim=1).values.mean().item()
-        r     = sim.max(dim=0).values.mean().item()
-        f     = 2*p*r/(p+r) if (p+r)>0 else 0.0
-        ps.append(p); rs.append(r); fs.append(f)
-    # ────────────────────────────────────────────────────────────────────────────────
+    # 5) Compute per‐sentence BERTScore
+    P, R, F1 = scorer.score(
+        cands=df["candidate"].astype(str).tolist(),
+        refs=[[r] for r in df["reference"].astype(str).tolist()]
+    )
 
-    # ─── 5) ATTACH SCORES & WRITE EXCEL ──────────────────────────────────────────
-    df["precision"] = [round(min(max(x,0.0),1.0),6) for x in ps]
-    df["recall"]    = [round(min(max(x,0.0),1.0),6) for x in rs]
-    df["f1"]        = [round(min(max(x,0.0),1.0),6) for x in fs]
+    df["precision"] = [round(min(max(x, 0.0), 1.0), 6) for x in P.tolist()]
+    df["recall"]    = [round(min(max(x, 0.0), 1.0), 6) for x in R.tolist()]
+    df["f1"]        = [round(min(max(x, 0.0), 1.0), 6) for x in F1.tolist()]
 
+    # 6) Write the single-sheet Excel that your webapp expects
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_fp = out_dir / "Bertscore_output.xlsx"
     df.to_excel(out_fp, index=False)
-    # ────────────────────────────────────────────────────────────────────────────────
 
-    # ─── 6) SUCCESS LINE ──────────────────────────────────────────────────────────
+    # 7) One line of stdout so Flask sees success
     print(f"✔️ Report saved to: {out_fp.resolve()}")
-    # ────────────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
