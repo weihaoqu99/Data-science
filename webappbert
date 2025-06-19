@@ -1,4 +1,3 @@
-#!/usr/bin/env python
 import os
 import sys
 import argparse
@@ -9,55 +8,37 @@ from typing import Union, List, Optional
 import pandas as pd
 from sacrebleu import sentence_bleu, sentence_chrf
 from sacrebleu.metrics import CHRF
-
-# ─── Monkey‐patch HF repo-id validator so Windows paths aren’t rejected ───────
-for module_name in ("huggingface_hub.utils.validators", "huggingface_hub.utils._validators"):
-    try:
-        mod = __import__(module_name, fromlist=["validate_repo_id"])
-        setattr(mod, "validate_repo_id", lambda *a, **k: None)
-    except ImportError:
-        pass
-# ────────────────────────────────────────────────────────────────────────────────
-
-# Force offline mode and point HF cache at your local model folder
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"]       = "1"
-os.environ["TRANSFORMERS_CACHE"]   = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-
-from bert_score import BERTScorer
-
+import evaluate  # picks up your local bertscore.py metric
 
 class TranslationEvaluator:
     """
     Load data
-    Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1)
+    Compute sentence-level BLEU, ChrF, ChrF++, and BERTScore (P/R/F1) via your local evaluate metric
     Compute macro-average model metrics
     Write Detailed + Model metrics to Excel
     """
     def __init__(
         self,
         output_file: Union[str, Path] = "Metrics_output.xlsx",
+        model_path: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large",
         baseline_tsv: str = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
     ):
+        # point evaluate/BERTScore to your local cache & baseline
+        os.environ["BERT"]     = model_path
+        os.environ["BASELINE"] = baseline_tsv
         warnings.simplefilter("ignore")
+
         self._data             = None
         self._detailed_results = None
         self._model_metrics    = None
         self._output_file      = Path(output_file)
         self._chrf             = CHRF(word_order=2)
 
-        # init BERTScorer with local cache + baseline TSV
+        # load your local bertscore metric
         try:
-            self._bertscorer = BERTScorer(
-                lang="en",
-                rescale_with_baseline=True,
-                model_type="roberta-large",      # valid HF name
-                baseline_path=baseline_tsv,
-                num_layers=24,                   # roberta-large
-                device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
-            )
+            self._bertscorer = evaluate.load("bertscore")
         except Exception as e:
-            print("ERROR: failed to init BERTScorer:", e, file=sys.stderr)
+            print("ERROR: failed to load local bertscore metric:", e, file=sys.stderr)
             sys.exit(1)
 
     def load_data(self, file_path: Union[str, Path]) -> None:
@@ -87,16 +68,24 @@ class TranslationEvaluator:
         self._compute_model_metrics(metrics, prediction_cols)
 
     def _validate_columns(
-        self, reference_col: str, prediction_cols: List[str], keep_cols: List[str]
+        self,
+        reference_col: str,
+        prediction_cols: List[str],
+        keep_cols: List[str]
     ) -> None:
-        missing = [c for c in [reference_col] + prediction_cols + keep_cols
-                   if c not in self._data.columns]
+        missing = [
+            c for c in [reference_col] + prediction_cols + keep_cols
+            if c not in self._data.columns
+        ]
         if missing:
             raise ValueError(f"Columns not found in data: {missing}")
 
     def _compute_detailed_metrics(
-        self, reference_col: str, prediction_cols: List[str],
-        metrics: List[str], keep_cols: List[str]
+        self,
+        reference_col: str,
+        prediction_cols: List[str],
+        metrics: List[str],
+        keep_cols: List[str]
     ) -> None:
         df = self._data.copy().astype(str)
 
@@ -118,49 +107,51 @@ class TranslationEvaluator:
                     axis=1
                 )
 
-        # BERTScore
+        # BERTScore via your local evaluate metric
         if "BERTScore" in metrics:
-            preds = []
-            refs  = []
-            for _, row in df.iterrows():
-                preds.append(row[prediction_cols[0]])
-                refs.append([row[reference_col]])
-            P, R, F1 = self._bertscorer.score(preds, refs)
-            df[f"{prediction_cols[0]} BERT-P"]  = P.tolist()
-            df[f"{prediction_cols[0]} BERT-R"]  = R.tolist()
-            df[f"{prediction_cols[0]} BERT-F1"] = F1.tolist()
+            preds = df[prediction_cols[0]].tolist()
+            refs  = [[r] for r in df[reference_col].tolist()]
+            out   = self._bertscorer.compute(
+                predictions=preds,
+                references=refs,
+                model_type=os.environ["BERT"],
+                num_layers=24,
+                device="cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu",
+                rescale_with_baseline=True,
+                baseline_path=os.environ["BASELINE"],
+                lang="en"
+            )
+            df[f"{prediction_cols[0]} BERT-P"]  = out["precision"]
+            df[f"{prediction_cols[0]} BERT-R"]  = out["recall"]
+            df[f"{prediction_cols[0]} BERT-F1"] = out["f1"]
 
-        # select columns
+        # select detailed columns
         cols = keep.copy()
         for p in prediction_cols:
             cols.append(p)
-            if "BLEU" in metrics:
-                cols.append(f"{p} BLEU")
-            if "ChrF" in metrics:
-                cols.append(f"{p} ChrF")
-            if "ChrF++" in metrics:
-                cols.append(f"{p} ChrF++")
+            if "BLEU" in metrics:    cols.append(f"{p} BLEU")
+            if "ChrF" in metrics:    cols.append(f"{p} ChrF")
+            if "ChrF++" in metrics:  cols.append(f"{p} ChrF++")
             if "BERTScore" in metrics:
                 cols += [f"{p} BERT-P", f"{p} BERT-R", f"{p} BERT-F1"]
 
         self._detailed_results = df[cols]
 
     def _compute_model_metrics(
-        self, metrics: List[str], prediction_cols: List[str]
+        self,
+        metrics: List[str],
+        prediction_cols: List[str]
     ) -> None:
         rows = []
         for p in prediction_cols:
             row = {"Model": p}
-            if "BLEU" in metrics:
-                row["BLEU"]    = self._detailed_results[f"{p} BLEU"].mean()
-            if "ChrF" in metrics:
-                row["ChrF"]    = self._detailed_results[f"{p} ChrF"].mean()
-            if "ChrF++" in metrics:
-                row["ChrF++"]  = self._detailed_results[f"{p} ChrF++"].mean()
+            if "BLEU" in metrics:    row["BLEU"]    = self._detailed_results[f"{p} BLEU"].mean()
+            if "ChrF" in metrics:    row["ChrF"]    = self._detailed_results[f"{p} ChrF"].mean()
+            if "ChrF++" in metrics:  row["ChrF++"]  = self._detailed_results[f"{p} ChrF++"].mean()
             if "BERTScore" in metrics:
-                row["BERT-P"]  = self._detailed_results[f"{p} BERT-P"].mean()
-                row["BERT-R"]  = self._detailed_results[f"{p} BERT-R"].mean()
-                row["BERT-F1"] = self._detailed_results[f"{p} BERT-F1"].mean()
+                row["BERT-P"]  = pd.Series(self._detailed_results[f"{p} BERT-P"]).mean()
+                row["BERT-R"]  = pd.Series(self._detailed_results[f"{p} BERT-R"]).mean()
+                row["BERT-F1"] = pd.Series(self._detailed_results[f"{p} BERT-F1"]).mean()
             rows.append(row)
         self._model_metrics = pd.DataFrame(rows)
 
@@ -180,20 +171,22 @@ class TranslationEvaluator:
             })
             # auto‐fit
             for idx, col in enumerate(self._model_metrics.columns):
-                w = max(self._model_metrics[col].astype(str).map(len).max(), len(col)) + 2
-                ws.set_column(idx, idx, w)
+                width = max(self._model_metrics[col].astype(str).map(len).max(), len(col)) + 2
+                ws.set_column(idx, idx, width)
 
         print(f"Report saved to: {self._output_file.resolve()}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run metrics with TranslationEvaluator")
     parser.add_argument(
-        "--output_dir", type=Path, required=True,
+        "--output_dir",
+        type=Path,
+        required=True,
         help="Directory to write Excel report"
     )
     parser.add_argument(
-        "files", nargs="+",
+        "files",
+        nargs="+",
         help="Input .csv/.xls/.xlsx files"
     )
     args = parser.parse_args()
