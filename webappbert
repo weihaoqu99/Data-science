@@ -5,7 +5,7 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import evaluate  # picks up your Local bertscore.py
+import evaluate  # will load your local bertscore.py
 
 def main():
     parser = argparse.ArgumentParser(
@@ -20,20 +20,29 @@ def main():
     parser.add_argument(
         "files",
         nargs="+",
-        help="One or more input .xls/.xlsx/.csv files with 'reference' & 'candidate' columns"
+        help="One or more input .xls/.xlsx/.csv files containing 'reference' & 'candidate' columns"
     )
     args = parser.parse_args()
 
+    # ─── your exact environment settings ──────────────────────────────────────────
     MODEL_PATH    = os.getenv(
         "BERT",
-        "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large"
+        "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
     )
-    BASELINE_PATH = "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large/en/roberta-large.tsv"
     DEVICE        = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+    BASELINE_PATH = "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/Versions-delete/roberta-large.tsv"
+    # ────────────────────────────────────────────────────────────────────────────────
 
-    # Load the metric defined in your bertscore.py
+    # Locate **your** local metric script
+    wrapper_dir = Path(__file__).parent
+    metric_py   = wrapper_dir / "Bertscore.py"
+    if not metric_py.exists():
+        print(f"ERROR: can't find local metric at {metric_py}", file=sys.stderr)
+        sys.exit(1)
+
+    # Load it explicitly by path
     try:
-        scorer = evaluate.load("bertscore")
+        scorer = evaluate.load(str(metric_py))
     except Exception as e:
         print("ERROR: failed to load bertscore metric:", e, file=sys.stderr)
         sys.exit(1)
@@ -45,14 +54,14 @@ def main():
         if not p.exists():
             print(f"ERROR: file not found: {fp}", file=sys.stderr)
             sys.exit(1)
-        if p.suffix.lower() in (".xls", ".xlsx"):
+        suf = p.suffix.lower()
+        if suf in (".xls", ".xlsx"):
             dfs.append(pd.read_excel(p))
-        elif p.suffix.lower() == ".csv":
+        elif suf == ".csv":
             dfs.append(pd.read_csv(p))
         else:
-            print(f"ERROR: unsupported file type: {p.suffix}", file=sys.stderr)
+            print(f"ERROR: unsupported file type: {suf}", file=sys.stderr)
             sys.exit(1)
-
     df = pd.concat(dfs, ignore_index=True)
 
     # Validate columns
@@ -79,14 +88,14 @@ def main():
     df["recall"]    = [round(min(max(x,0.0),1.0),6) for x in out["recall"]]
     df["f1"]        = [round(min(max(x,0.0),1.0),6) for x in out["f1"]]
 
-    # Write out Excel
-    out_dir = args.output_dir
+    # Write out Excel where your JSON expects it
+    out_dir     = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
-    output_path = out_dir / "Bertscore_output.xlsx"
-    df.to_excel(output_path, index=False)
+    output_fp   = out_dir / "Bertscore_output.xlsx"
+    df.to_excel(output_fp, index=False)
 
-    print("✅ All done!")
-    print(f"✔️ Report saved to: {output_path.resolve()}")
+    # Single success line for Flask to capture
+    print(f"✔️ Report saved to: {output_fp.resolve()}")
 
 if __name__ == "__main__":
     main()
