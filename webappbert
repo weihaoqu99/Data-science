@@ -1,151 +1,16 @@
 #!/usr/bin/env python
 import os
+import sys
 import argparse
-import warnings
 from pathlib import Path
 
 import pandas as pd
-import torch
-import torch.nn.functional as F
-from transformers import AutoTokenizer, AutoModel
+import evaluate  # picks up your Local bertscore.py
 
-# ─── Offline HuggingFace setup ─────────────────────────────────────────────────
-MODEL_PATH = "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-os.environ["TRANSFORMERS_CACHE"]   = MODEL_PATH
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-# ────────────────────────────────────────────────────────────────────────────────
-
-class BertScoreEvaluator:
-    """
-    1) Load one or more input files (CSV/XLSX)
-    2) Compute per-sentence BERTScore (P, R, F1)
-    3) Compute macro-average over all sentences
-    4) Write two sheets: Detailed metrics + Model metrics
-    """
-    def __init__(self, output_file: Path, device: str = "cpu"):
-        warnings.simplefilter("ignore")
-        self.device    = torch.device(device)
-        # load tokenizer & model from local path
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            MODEL_PATH, local_files_only=True
-        )
-        self.model     = AutoModel.from_pretrained(
-            MODEL_PATH, local_files_only=True
-        ).to(self.device)
-        self.model.eval()
-
-        self._data     = None
-        self._detailed = None
-        self._summary  = None
-        self._out      = output_file
-
-    def load_data(self, fp: Path):
-        """Read one CSV/XLSX, concatenate if called multiple times."""
-        suffix = fp.suffix.lower()
-        if suffix in (".xls", ".xlsx"):
-            df = pd.read_excel(fp)
-        elif suffix == ".csv":
-            df = pd.read_csv(fp)
-        else:
-            raise ValueError(f"Unsupported file type: {suffix}")
-
-        if self._data is None:
-            self._data = df
-        else:
-            self._data = pd.concat([self._data, df], ignore_index=True)
-
-    def _score_pair(self, cand: str, ref: str):
-        """Return (P, R, F1) for a single sentence pair."""
-        # tokenize + encode
-        enc_c = self.tokenizer(cand, return_tensors="pt", truncation=True, max_length=512)
-        enc_r = self.tokenizer(ref, return_tensors="pt", truncation=True, max_length=512)
-        with torch.no_grad():
-            out_c = self.model(**{k:v.to(self.device) for k,v in enc_c.items()})
-            out_r = self.model(**{k:v.to(self.device) for k,v in enc_r.items()})
-        # take last hidden state, normalize
-        emb_c = F.normalize(out_c.last_hidden_state.squeeze(0), dim=1)  # (len_c, d)
-        emb_r = F.normalize(out_r.last_hidden_state.squeeze(0), dim=1)  # (len_r, d)
-        # similarity matrix
-        sim = emb_c @ emb_r.T
-        # precision = mean over cand‐tokens of max(sim to any ref‐token)
-        p = sim.max(dim=1).values.mean().item()
-        # recall = mean over ref‐tokens of max(sim to any cand‐token)
-        r = sim.max(dim=0).values.mean().item()
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
-        return p, r, f1
-
-    def evaluate(
-        self,
-        prediction_cols: list = ["candidate"],
-        reference_col:    str  = "reference",
-        keep_cols:        list = None
-    ):
-        """Compute detailed + summary BERTScore over the loaded data."""
-        if self._data is None:
-            raise ValueError("No data loaded. Call load_data() first.")
-
-        df = self._data.copy().astype(str)
-        keep = keep_cols or []
-        if reference_col not in keep:
-            keep = [reference_col] + keep
-
-        # per‐sentence
-        for pcol in prediction_cols:
-            ps, rs, fs = [], [], []
-            for _, row in df.iterrows():
-                p, r, f = self._score_pair(row[pcol], row[reference_col])
-                ps.append(p); rs.append(r); fs.append(f)
-            df[f"{pcol} BERT-P"]  = ps
-            df[f"{pcol} BERT-R"]  = rs
-            df[f"{pcol} BERT-F1"] = fs
-
-        # Detailed sheet
-        cols = keep.copy()
-        for pcol in prediction_cols:
-            cols.append(pcol)
-            cols += [f"{pcol} BERT-P", f"{pcol} BERT-R", f"{pcol} BERT-F1"]
-        self._detailed = df[cols]
-
-        # Macro‐average summary
-        rows = []
-        for pcol in prediction_cols:
-            rows.append({
-                "Model": pcol,
-                "BERT-P": df[f"{pcol} BERT-P"].mean(),
-                "BERT-R": df[f"{pcol} BERT-R"].mean(),
-                "BERT-F1":df[f"{pcol} BERT-F1"].mean()
-            })
-        self._summary = pd.DataFrame(rows)
-
-    def generate_report(self):
-        """Write out the two‐sheet Excel file."""
-        self._out.parent.mkdir(exist_ok=True, parents=True)
-        with pd.ExcelWriter(self._out, engine="xlsxwriter") as writer:
-            # 1) Detailed per‐sentence (you’ll ignore this in the JSON)
-            self._detailed.to_excel(writer, sheet_name="Detailed metrics", index=False)
-            # 2) Macro‐avg summary (your webapp reads “Model metrics”)
-            self._summary.to_excel(writer, sheet_name="Model metrics", index=False)
-
-            # format the Model metrics sheet
-            wb = writer.book
-            ws = writer.sheets["Model metrics"]
-            max_row, max_col = self._summary.shape
-            headers = [{"header": c} for c in self._summary.columns]
-            ws.add_table(0, 0, max_row, max_col-1, {
-                "columns": headers,
-                "style":   "Table Style Medium 9",
-                "name":    "BertScoreSummary"
-            })
-            # auto‐fit
-            for idx, col in enumerate(self._summary.columns):
-                width = max(self._summary[col].astype(str).map(len).max(), len(col)) + 2
-                ws.set_column(idx, idx, width)
-
-        print(f"✔️ Report saved to: {self._out.resolve()}")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Compute offline BERTScore")
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run BERTScore metrics with your local bertscore implementation"
+    )
     parser.add_argument(
         "--output_dir",
         type=Path,
@@ -155,25 +20,73 @@ if __name__ == "__main__":
     parser.add_argument(
         "files",
         nargs="+",
-        help="One or more input .csv/.xls/.xlsx files"
+        help="One or more input .xls/.xlsx/.csv files with 'reference' & 'candidate' columns"
     )
     args = parser.parse_args()
 
-    out_dir  = args.output_dir
-    out_dir.mkdir(exist_ok=True, parents=True)
-    out_fp   = out_dir / "Bertscore_output.xlsx"
-
-    evaluator = BertScoreEvaluator(output_file=out_fp, device="cpu")
-    for f in args.files:
-        print(f"▶ Loading   {f}")
-        evaluator.load_data(Path(f))
-
-    evaluator.evaluate(
-        prediction_cols=["candidate"],
-        reference_col="reference",
-        keep_cols=None
+    MODEL_PATH    = os.getenv(
+        "BERT",
+        "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large"
     )
-    evaluator.generate_report()
+    BASELINE_PATH = "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large/en/roberta-large.tsv"
+    DEVICE        = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+
+    # Load the metric defined in your bertscore.py
+    try:
+        scorer = evaluate.load("bertscore")
+    except Exception as e:
+        print("ERROR: failed to load bertscore metric:", e, file=sys.stderr)
+        sys.exit(1)
+
+    # Read & concatenate all input files
+    dfs = []
+    for fp in args.files:
+        p = Path(fp)
+        if not p.exists():
+            print(f"ERROR: file not found: {fp}", file=sys.stderr)
+            sys.exit(1)
+        if p.suffix.lower() in (".xls", ".xlsx"):
+            dfs.append(pd.read_excel(p))
+        elif p.suffix.lower() == ".csv":
+            dfs.append(pd.read_csv(p))
+        else:
+            print(f"ERROR: unsupported file type: {p.suffix}", file=sys.stderr)
+            sys.exit(1)
+
+    df = pd.concat(dfs, ignore_index=True)
+
+    # Validate columns
+    for col in ("reference", "candidate"):
+        if col not in df.columns:
+            print(f"ERROR: missing required column '{col}'", file=sys.stderr)
+            sys.exit(1)
+
+    # Compute BERTScore
+    print("▶ Computing BERTScore…")
+    out = scorer.compute(
+        predictions=df["candidate"].astype(str).tolist(),
+        references=df["reference"].astype(str).tolist(),
+        model_type=MODEL_PATH,
+        num_layers=17,
+        device=DEVICE,
+        rescale_with_baseline=True,
+        baseline_path=BASELINE_PATH,
+        lang="en"
+    )
+
+    # Attach to DataFrame
+    df["precision"] = [round(min(max(x,0.0),1.0),6) for x in out["precision"]]
+    df["recall"]    = [round(min(max(x,0.0),1.0),6) for x in out["recall"]]
+    df["f1"]        = [round(min(max(x,0.0),1.0),6) for x in out["f1"]]
+
+    # Write out Excel
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    output_path = out_dir / "Bertscore_output.xlsx"
+    df.to_excel(output_path, index=False)
+
     print("✅ All done!")
-    
-    
+    print(f"✔️ Report saved to: {output_path.resolve()}")
+
+if __name__ == "__main__":
+    main()
