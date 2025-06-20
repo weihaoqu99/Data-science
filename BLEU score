@@ -196,3 +196,58 @@ if __name__ == "__main__":
     evaluator.generate_report()
 
     print("✅ All done!")  # exit code 0
+    
+    
+    
+    
+    
+    
+
+
+
+
+
+
+if __name__ == "__main__":
+    import argparse
+    from pathlib import Path
+
+    parser = argparse.ArgumentParser(
+        description="Run BLE_CHF_CHP metrics with TranslationEvaluator"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        required=True,
+        help="Directory in which to write the Excel report"
+    )
+    parser.add_argument(
+        "files",
+        nargs="+",
+        help="One or more input .csv/.xls/.xlsx files to process"
+    )
+    args = parser.parse_args()
+
+    # Make sure the output folder exists
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    # Build the exact output filename your front‐end expects
+    output_path = args.output_dir / "BleuChrfscores_output.xlsx"
+
+    # Instantiate your evaluator
+    evaluator = TranslationEvaluator(output_file=output_path)
+
+    # Load each file
+    for f in args.files:
+        print(f"▶ Loading data from {f}")
+        evaluator.load_data(f)
+
+    # Run BLEU / ChrF / ChrF++ 
+    evaluator.evaluate(
+        prediction_cols=["candidate"],
+        reference_col="reference",
+        metrics=["BLEU", "ChrF", "ChrF++"],
+        keep_cols=None
+    )
+    evaluator.generate_report()
+
+    print("✅ All done!")
