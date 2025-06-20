@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 from transformers import RobertaTokenizer, RobertaModel
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Compute BERTScore offline with local RoBERTa-large"
@@ -76,27 +77,24 @@ def main():
     # ─── Compute BERTScore sentence by sentence ─────────────────────────────
     precisions, recalls, f1s = [], [], []
     for cand, ref in zip(df["candidate"].astype(str), df["reference"].astype(str)):
-        # tokenize
         ec = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512).to(device)
         er = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512).to(device)
-        # embed
         with torch.no_grad():
-            oc  = model(**ec).last_hidden_state.squeeze(0)   # [T1,d]
-            or_ = model(**er).last_hidden_state.squeeze(0)   # [T2,d]
-        # normalize & similarity
-        nc  = F.normalize(oc,  dim=1)  # [T1,d]
-        nr  = F.normalize(or_, dim=1)  # [T2,d]
-        sim = nc @ nr.T                # [T1,T2]
-        p   = sim.max(dim=1).values.mean().item()
-        r   = sim.max(dim=0).values.mean().item()
-        f   = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+            oc = model(**ec).last_hidden_state.squeeze(0)   # [T1,d]
+            or_ = model(**er).last_hidden_state.squeeze(0)  # [T2,d]
+        nc = F.normalize(oc,  dim=1)  # [T1,d]
+        nr = F.normalize(or_, dim=1)  # [T2,d]
+        sim = nc @ nr.T               # [T1,T2]
+        p = sim.max(dim=1).values.mean().item()
+        r = sim.max(dim=0).values.mean().item()
+        f = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
         precisions.append(round(p, 6))
         recalls.append(round(r, 6))
         f1s.append(round(f, 6))
     # ────────────────────────────────────────────────────────────────────────
 
-    # ─── Attach scores & write out (to a sheet named "Model metrics") ───────
+    # ─── Attach scores & write out ─────────────────────────────────────────
     df["precision"] = precisions
     df["recall"]    = recalls
     df["f1"]        = f1s
@@ -105,12 +103,12 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     out_fp = out_dir / "Bertscore_output.xlsx"
 
-    # ←— here’s the only change:
+    # Write with sheet name "Model metrics"
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="Model metrics", index=False)
 
     print(f"✔️  Report saved to: {out_fp.resolve()}")
-    # ────────────────────────────────────────────────────────────────────────
+
 
 if __name__ == "__main__":
     main()
