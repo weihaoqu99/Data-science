@@ -1,41 +1,51 @@
 #!/usr/bin/env python
 import os
-import traceback
+import sys
+import argparse
+from pathlib import Path
+
+import pandas as pd
+import torch
+import torch.nn.functional as F
+from transformers import RobertaTokenizer, RobertaModel
+import evaluate  # loads your local bertscore.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import evaluate   # will load your local bertscore.py
 from fastapi.responses import FileResponse
 
-app = FastAPI()
-
-# ─── configuration ─────────────────────────────────────────────────────────
-# directory containing your Automation_Scripts/bertscore.py
-METRIC_SCRIPT_DIR = os.path.join(os.path.dirname(__file__), "Automation_Scripts")
-# your local model & baseline paths
-MODEL_PATH    = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
+# ─── Configuration ─────────────────────────────────────────────────────────
+MODEL_DIR     = Path(os.getenv("BERT", r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"))
+BASELINE_PATH = Path(os.getenv("BASELINE", r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"))
 DEVICE        = "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
-# ────────────────────────────────────────────────────────────────────────────
 
-# load your local bertscore metric
+# 1) Load local BERTScore metric
 try:
-    scorer = evaluate.load(
-        path=METRIC_SCRIPT_DIR,    # loads Automation_Scripts/bertscore.py
-        module_type="metric"
-    )
+    METRIC_SCRIPT_DIR = Path(__file__).parent / "Automation_Scripts"
+    scorer = evaluate.load(path=str(METRIC_SCRIPT_DIR), module_type="metric")
     print("✅ Loaded local bertscore metric")
 except Exception as e:
-    print("❌ ERROR loading local bertscore metric:", e)
+    print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
     scorer = None
+
+# 2) Load local model+tokenizer
+if not MODEL_DIR.is_dir():
+    print(f"❌ ERROR: cannot find model dir at {MODEL_DIR}", file=sys.stderr)
+    sys.exit(1)
+
+tokenizer = RobertaTokenizer.from_pretrained(str(MODEL_DIR), local_files_only=True, use_fast=False)
+model     = RobertaModel.from_pretrained(str(MODEL_DIR), local_files_only=True).to(DEVICE).eval()
+
+# ─── FastAPI setup ─────────────────────────────────────────────────────────
+app = FastAPI()
 
 class ScoreRequest(BaseModel):
     reference: list[str]
     candidate: list[str]
 
 class ScoreResponse(BaseModel):
-    precision:  list[float]
-    recall:     list[float]
-    f1:         list[float]
+    precision: list[float]
+    recall:    list[float]
+    f1:        list[float]
     model_type: str = "roberta-large"
     version:    str = "0.3.12"
 
@@ -45,29 +55,114 @@ async def calculate_score(request: ScoreRequest):
         raise HTTPException(500, "Metric failed to load")
     if len(request.reference) != len(request.candidate):
         raise HTTPException(400, "reference and candidate must have the same length")
+    if not request.reference:
+        raise HTTPException(400, "no sentences provided")
 
-    try:
-        out = scorer.compute(
-            predictions=[request.candidate[0].strip()],
-            references=[request.reference[0].strip()],
-            model_type=MODEL_PATH,
-            num_layers=17,
-            device=DEVICE,
-            rescale_with_baseline=True,
-            baseline_path=BASELINE_PATH,
-            lang="en"
-        )
-        P, R, F1 = out["precision"], out["recall"], out["f1"]
+    precisions, recalls, f1s = [], [], []
+    for ref, cand in zip(request.reference, request.candidate):
+        enc_ref  = tokenizer(ref.strip(),  truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+        enc_cand = tokenizer(cand.strip(), truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            h_ref  = model(**enc_ref).last_hidden_state.squeeze(0)   # [T1,d]
+            h_cand = model(**enc_cand).last_hidden_state.squeeze(0)  # [T2,d]
+        n_ref  = F.normalize(h_ref,  dim=1)  # [T1,d]
+        n_cand = F.normalize(h_cand, dim=1)  # [T2,d]
+        sim = n_cand @ n_ref.T               # [T2,T1]
+        P   = sim.max(dim=1).values.mean().item()
+        R   = sim.max(dim=0).values.mean().item()
+        F1  = 2 * P * R / (P + R) if (P + R) > 0 else 0.0
 
-        return {
-            "precision": [round(min(max(x, 0.0), 1.0), 6) for x in P],
-            "recall":    [round(min(max(x, 0.0), 1.0), 6) for x in R],
-            "f1":        [round(min(max(x, 0.0), 1.0), 6) for x in F1],
-            "model_type":"roberta-large",
-            "version":   "0.3.12"
-        }
+        precisions.append(round(max(min(P,1.0),0.0), 6))
+        recalls.append(   round(max(min(R,1.0),0.0), 6))
+        f1s.append(       round(max(min(F1,1.0),0.0),6))
 
-    except Exception as e:
-        print(traceback.format_exc())
-        raise HTTPException(500, str(e))
+    return ScoreResponse(precision=precisions, recall=recalls, f1=f1s)
 
+
+# ─── CLI mode function ────────────────────────────────────────────────────
+def cli_main(input_files: list[str], output_dir: Path):
+    dfs = []
+    for fn in input_files:
+        p = Path(fn)
+        if p.suffix.lower() in (".xls", ".xlsx"):
+            dfs.append(pd.read_excel(p))
+        elif p.suffix.lower() == ".csv":
+            dfs.append(pd.read_csv(p))
+        else:
+            print(f"❌ ERROR: unsupported file type {p.suffix}", file=sys.stderr)
+            sys.exit(1)
+    if not dfs:
+        print("❌ ERROR: no data loaded", file=sys.stderr)
+        sys.exit(1)
+    df = pd.concat(dfs, ignore_index=True)
+
+    for col in ("reference", "candidate"):
+        if col not in df.columns:
+            print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
+            sys.exit(1)
+
+    precisions, recalls, f1s = [], [], []
+    for cand, ref in zip(df["candidate"].astype(str), df["reference"].astype(str)):
+        enc_c = tokenizer(cand.strip(),  truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+        enc_r = tokenizer(ref.strip(),  truncation=True, max_length=512, return_tensors="pt").to(DEVICE)
+        with torch.no_grad():
+            oc  = model(**enc_c).last_hidden_state.squeeze(0)
+            or_ = model(**enc_r).last_hidden_state.squeeze(0)
+        nc = F.normalize(oc,  dim=1)
+        nr = F.normalize(or_, dim=1)
+        sim = nc @ nr.T
+        p   = sim.max(dim=1).values.mean().item()
+        r   = sim.max(dim=0).values.mean().item()
+        f   = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
+
+        precisions.append(round(p,6))
+        recalls.append(round(r,6))
+        f1s.append(round(f,6))
+
+    df["precision"] = precisions
+    df["recall"]    = recalls
+    df["f1"]        = f1s
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_fp = output_dir / "Bertscore_output.xlsx"
+    with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
+        df[["reference","candidate","precision","recall","f1"]] \
+          .to_excel(writer, sheet_name="Detailed metrics", index=False)
+
+        summary = pd.DataFrame([{
+            "precision": df["precision"].mean(),
+            "recall":    df["recall"].mean(),
+            "f1":        df["f1"].mean()
+        }]).round(6)
+        summary.to_excel(writer, sheet_name="Model metrics", index=False)
+
+    print(f"✔️  Report saved to: {out_fp.resolve()}")
+
+
+# ─── Main: dispatch to CLI vs Server ──────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="Offline BERTScore CLI & FastAPI Server"
+    )
+    parser.add_argument(
+        "--output_dir",
+        type=Path,
+        help="Run CLI mode if set (plus input files)"
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help="Input CSV/XLSX files for CLI"
+    )
+    args = parser.parse_args()
+
+    if args.output_dir and args.files:
+        cli_main(args.files, args.output_dir)
+    else:
+        import uvicorn
+        uvicorn.run("bertscore_webapp:app", host="0.0.0.0", port=8000, reload=True)
+
+
+if __name__ == "__main__":
+    main()
+    
