@@ -1,0 +1,73 @@
+#!/usr/bin/env python
+import os
+import traceback
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import evaluate   # will load your local bertscore.py
+from fastapi.responses import FileResponse
+
+app = FastAPI()
+
+# ─── configuration ─────────────────────────────────────────────────────────
+# directory containing your Automation_Scripts/bertscore.py
+METRIC_SCRIPT_DIR = os.path.join(os.path.dirname(__file__), "Automation_Scripts")
+# your local model & baseline paths
+MODEL_PATH    = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
+DEVICE        = "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
+# ────────────────────────────────────────────────────────────────────────────
+
+# load your local bertscore metric
+try:
+    scorer = evaluate.load(
+        path=METRIC_SCRIPT_DIR,    # loads Automation_Scripts/bertscore.py
+        module_type="metric"
+    )
+    print("✅ Loaded local bertscore metric")
+except Exception as e:
+    print("❌ ERROR loading local bertscore metric:", e)
+    scorer = None
+
+class ScoreRequest(BaseModel):
+    reference: list[str]
+    candidate: list[str]
+
+class ScoreResponse(BaseModel):
+    precision:  list[float]
+    recall:     list[float]
+    f1:         list[float]
+    model_type: str = "roberta-large"
+    version:    str = "0.3.12"
+
+@app.post("/bertscore/", response_model=ScoreResponse)
+async def calculate_score(request: ScoreRequest):
+    if scorer is None:
+        raise HTTPException(500, "Metric failed to load")
+    if len(request.reference) != len(request.candidate):
+        raise HTTPException(400, "reference and candidate must have the same length")
+
+    try:
+        out = scorer.compute(
+            predictions=[request.candidate[0].strip()],
+            references=[request.reference[0].strip()],
+            model_type=MODEL_PATH,
+            num_layers=17,
+            device=DEVICE,
+            rescale_with_baseline=True,
+            baseline_path=BASELINE_PATH,
+            lang="en"
+        )
+        P, R, F1 = out["precision"], out["recall"], out["f1"]
+
+        return {
+            "precision": [round(min(max(x, 0.0), 1.0), 6) for x in P],
+            "recall":    [round(min(max(x, 0.0), 1.0), 6) for x in R],
+            "f1":        [round(min(max(x, 0.0), 1.0), 6) for x in F1],
+            "model_type":"roberta-large",
+            "version":   "0.3.12"
+        }
+
+    except Exception as e:
+        print(traceback.format_exc())
+        raise HTTPException(500, str(e))
+
