@@ -5,20 +5,13 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import evaluate
-import numpy as np
 import torch
-
-# ─── Offline HuggingFace setup ─────────────────────────────────────────────
-# Point these at your on-disk model and baseline .tsv
-MODEL_PATH    = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/en/roberta-large.tsv"
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
-# ────────────────────────────────────────────────────────────────────────────
+import torch.nn.functional as F
+from transformers import RobertaTokenizer, RobertaModel
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Compute BERTScore offline via HuggingFace evaluate"
+        description="Compute BERTScore offline with local RoBERTa-large"
     )
     parser.add_argument(
         "--output_dir",
@@ -33,15 +26,28 @@ def main():
     )
     args = parser.parse_args()
 
-    # ─── Load the custom bertscore metric from local script ─────────────────
-    try:
-        # the path here is relative to where this script lives
-        metric_script = Path(__file__).parent / "bertscore.py"
-        scorer = evaluate.load(str(metric_script), module_type="metric")
-    except Exception as e:
-        print("ERROR: failed to load local bertscore metric:", e, file=sys.stderr)
+    # ─── Setup local model cache (no Hub) ────────────────────────────────────
+    MODEL_DIR = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
+    if not MODEL_DIR.is_dir():
+        print(f"ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
         sys.exit(1)
-    # ─────────────────────────────────────────────────────────────────────────
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    try:
+        tokenizer = RobertaTokenizer.from_pretrained(
+            str(MODEL_DIR),
+            local_files_only=True,
+            use_fast=False
+        )
+        model = RobertaModel.from_pretrained(
+            str(MODEL_DIR),
+            local_files_only=True
+        ).to(device).eval()
+    except Exception as e:
+        print("ERROR: loading local RoBERTa-large model/tokenizer failed:", e, file=sys.stderr)
+        sys.exit(1)
+    # ────────────────────────────────────────────────────────────────────────
 
     # ─── Read & concatenate all inputs ──────────────────────────────────────
     dfs = []
@@ -58,39 +64,53 @@ def main():
         print("ERROR: no data loaded", file=sys.stderr)
         sys.exit(1)
     df = pd.concat(dfs, ignore_index=True)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────
 
     # ─── Verify required columns ────────────────────────────────────────────
     for col in ("reference", "candidate"):
         if col not in df.columns:
             print(f"ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────
 
-    # ─── Compute BERTScore via evaluate.scorer ───────────────────────────────
-    out = scorer.compute(
-        predictions=df["candidate"].astype(str).tolist(),
-        references=df["reference"].astype(str).tolist(),
-        model_type=MODEL_PATH,
-        num_layers=17,
-        device=DEVICE,
-        rescale_with_baseline=True,
-        baseline_path=BASELINE_PATH,
-        lang="en"
-    )
+    # ─── Compute BERTScore sentence by sentence ─────────────────────────────
+    precisions, recalls, f1s = [], [], []
+    for cand, ref in zip(df["candidate"].astype(str), df["reference"].astype(str)):
+        # tokenize
+        ec = tokenizer(cand, return_tensors="pt", truncation=True, max_length=512).to(device)
+        er = tokenizer(ref,  return_tensors="pt", truncation=True, max_length=512).to(device)
+        # embed
+        with torch.no_grad():
+            oc  = model(**ec).last_hidden_state.squeeze(0)   # [T1,d]
+            or_ = model(**er).last_hidden_state.squeeze(0)   # [T2,d]
+        # normalize & similarity
+        nc  = F.normalize(oc,  dim=1)  # [T1,d]
+        nr  = F.normalize(or_, dim=1)  # [T2,d]
+        sim = nc @ nr.T                # [T1,T2]
+        p   = sim.max(dim=1).values.mean().item()
+        r   = sim.max(dim=0).values.mean().item()
+        f   = 2 * p * r / (p + r) if (p + r) > 0 else 0.0
 
-    # round & attach
-    df["precision"] = [round(x, 6) for x in out["precision"]]
-    df["recall"]    = [round(x, 6) for x in out["recall"]]
-    df["f1"]        = [round(x, 6) for x in out["f1"]]
-    # ─────────────────────────────────────────────────────────────────────────
+        precisions.append(round(p, 6))
+        recalls.append(round(r, 6))
+        f1s.append(round(f, 6))
+    # ────────────────────────────────────────────────────────────────────────
 
-    # ─── Write result to Excel ───────────────────────────────────────────────
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    out_fp = args.output_dir / "Bertscore_output.xlsx"
-    df.to_excel(out_fp, index=False)
+    # ─── Attach scores & write out (to a sheet named "Model metrics") ───────
+    df["precision"] = precisions
+    df["recall"]    = recalls
+    df["f1"]        = f1s
+
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_fp = out_dir / "Bertscore_output.xlsx"
+
+    # ←— here’s the only change:
+    with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
+        df.to_excel(writer, sheet_name="Model metrics", index=False)
+
     print(f"✔️  Report saved to: {out_fp.resolve()}")
-    # ─────────────────────────────────────────────────────────────────────────
+    # ────────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     main()
