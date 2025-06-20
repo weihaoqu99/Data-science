@@ -5,29 +5,32 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
+import evaluate
 import torch
 import torch.nn.functional as F
 from transformers import RobertaTokenizer, RobertaModel
-import evaluate  # to load your local bertscore.py
 
 # ─── Configuration ─────────────────────────────────────────────────────────
+
+# point these at your local folders/files:
 MODEL_DIR     = Path(r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
 BASELINE_PATH = MODEL_DIR / "roberta-large.tsv"
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 1) load your local bertscore metric implementation
+# ─── Prepare tokenizer, model & CLI‐only metric loader ──────────────────────
+
+# 1) load your “metric script” (this file itself) so evaluate.compute() works:
 try:
-    METRIC_SCRIPT_DIR = Path(__file__).parent / "Automation_Scripts"
     scorer = evaluate.load(
-        path=str(METRIC_SCRIPT_DIR),
+        path=str(Path(__file__).parent),
         module_type="metric"
     )
     print("✅ Loaded local bertscore metric")
 except Exception as e:
-    print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
+    print("❌ ERROR loading local bertscore metric:", e, file=sys.stderr)
     scorer = None
 
-# 2) load local RoBERTa for the offline loop
+# 2) load the actual RoBERTa model + tokenizer once:
 if not MODEL_DIR.is_dir():
     print(f"❌ ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
     sys.exit(1)
@@ -47,7 +50,7 @@ def cli_main(input_files: list[str], output_dir: Path):
         print("❌ ERROR: scorer not loaded, aborting", file=sys.stderr)
         sys.exit(1)
 
-    # ─── read & concat all inputs ───────────────────────────────────────────
+    # ─── Read & concatenate all inputs ─────────────────────────────────────
     dfs = []
     for fn in input_files:
         p = Path(fn)
@@ -63,15 +66,14 @@ def cli_main(input_files: list[str], output_dir: Path):
     if not dfs:
         print("❌ ERROR: no data loaded", file=sys.stderr)
         sys.exit(1)
-    df = pd.concat(dfs, ignore_index=True)
 
-    # ─── validate required columns ──────────────────────────────────────────
+    df = pd.concat(dfs, ignore_index=True)
     for col in ("reference", "candidate"):
         if col not in df.columns:
             print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # ─── compute BERTScore via your local metric ─────────────────────────────
+    # ─── Compute with your local evaluate‐wrapped metric ────────────────────
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -86,14 +88,16 @@ def cli_main(input_files: list[str], output_dir: Path):
     df["recall"]    = out["recall"]
     df["f1"]        = out["f1"]
 
-    # ─── write Excel with two sheets ────────────────────────────────────────
+    # ─── Write Excel with two sheets ────────────────────────────────────────
     output_dir.mkdir(parents=True, exist_ok=True)
     out_fp = output_dir / "Bertscore_output.xlsx"
+
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # detailed per‐sentence
+        # 1) per‐sentence
         df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
-        # one‐row averages
+
+        # 2) one‐row averages
         summary = pd.DataFrame([{
             "precision": df["precision"].mean(),
             "recall":    df["recall"].mean(),
@@ -106,7 +110,7 @@ def cli_main(input_files: list[str], output_dir: Path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Offline BERTScore CLI (local RoBERTa-large w/ baseline rescoring)"
+        description="Offline BERTScore CLI (local RoBERTa-large with baseline rescoring)"
     )
     parser.add_argument(
         "--output_dir",
