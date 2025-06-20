@@ -1,0 +1,35 @@
+{
+  "NLP": [
+    "Session_Id",
+    "Branch",
+    "Summary_transcript",
+    "Intent_transcript",
+    "Ground Truth Intent Tester 1",
+    "Ground Truth Intent Tester 2"
+  ],
+  "CPS": [
+    "Session ID",
+    "Cumulative Transcript",
+    "Summary Transcript",
+    "Tester 1 Accuracy",
+    "Tester 1 Hallucination",
+    "Tester 2 Accuracy",
+    "Tester 2 Hallucination"
+  ],
+  "BLE_CHF_CHP": [
+    "reference",
+    "es",
+    "candidate"
+  ],
+  "Bertscore": [
+    "es",
+    "reference",
+    "candidate"
+  ],
+  "ASR": [
+    "session_id",
+    "raw_transcript",
+    "Ground Truth Transcript",
+    "Hallucination"
+  ]
+}
