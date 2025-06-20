@@ -102,12 +102,47 @@ def main():
     out_dir = args.output_dir
     out_dir.mkdir(parents=True, exist_ok=True)
     out_fp = out_dir / "Bertscore_output.xlsx"
+    
+    
+    
+        # ─── Attach scores & write out ─────────────────────────────────────────
+    df["precision"] = precisions
+    df["recall"]    = recalls
+    df["f1"]        = f1s
+
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_fp = out_dir / "Bertscore_output.xlsx"
+
+-   # Write every sentence into the sheet
+-   with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
+-       df.to_excel(writer, sheet_name="Model metrics", index=False)
++   # Compute the averages
++   avg_p = round(df["precision"].mean(), 6)
++   avg_r = round(df["recall"].mean(),    6)
++   avg_f = round(df["f1"].mean(),        6)
++
++   # Build a one‐row DataFrame and write only that to "Model metrics"
++   summary = pd.DataFrame([{
++       "precision": avg_p,
++       "recall":    avg_r,
++       "f1":        avg_f
++   }])
++
++   with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
++       summary.to_excel(writer, sheet_name="Model metrics", index=False)
+
+    print(f"✔️  Report saved to: {out_fp.resolve()}")
 
     # Write with sheet name "Model metrics"
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
         df.to_excel(writer, sheet_name="Model metrics", index=False)
 
     print(f"✔️  Report saved to: {out_fp.resolve()}")
+    
+    
+    
+    
 
 
 if __name__ == "__main__":
