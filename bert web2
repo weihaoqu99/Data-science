@@ -147,3 +147,33 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+    
+    
+    
+        # ... after sentence‐by‐sentence loop ...
+
+    df["precision"] = precisions
+    df["recall"]    = recalls
+    df["f1"]        = f1s
+
+    out_dir = args.output_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_fp = out_dir / "Bertscore_output.xlsx"
+
+    # Compute the averages
+    avg_p = round(df["precision"].mean(), 6)
+    avg_r = round(df["recall"].mean(),    6)
+    avg_f = round(df["f1"].mean(),        6)
+
+    # Write only that one row
+    summary = pd.DataFrame([{
+        "precision": avg_p,
+        "recall":    avg_r,
+        "f1":        avg_f
+    }])
+    with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
+        summary.to_excel(writer, sheet_name="Model metrics", index=False)
+
+    print(f"✔️  Report saved to: {out_fp.resolve()}")
