@@ -11,26 +11,20 @@ from transformers import RobertaTokenizer, RobertaModel
 import evaluate  # for loading the local bertscore metric
 
 # ─── CONFIG ─────────────────────────────────────────────────────────────────
-# Where your RoBERTa model sits:
-MODEL_DIR = Path(
-    os.getenv("BERT", 
-              r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
+MODEL_DIR     = Path(
+    os.getenv("BERT", r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
 ).expanduser().resolve()
-
-# Where your baseline TSV is:
 BASELINE_PATH = MODEL_DIR / "roberta-large.tsv"
-
-# Device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ─── 1) Load the custom bertscore metric ─────────────────────────────────
+METRIC_FILE = Path(__file__).resolve()  # this file itself
 try:
-    METRIC_SCRIPT_DIR = Path(__file__).parent  # Automation_Scripts folder
     scorer = evaluate.load(
-        path=str(METRIC_SCRIPT_DIR),
+        path=str(METRIC_FILE),
         module_type="metric"
     )
-    print("✅ Loaded local bertscore metric")
+    print("✅ Loaded local bertscore metric from", METRIC_FILE, file=sys.stderr)
 except Exception as e:
     print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
     scorer = None
@@ -49,7 +43,7 @@ try:
         .to(DEVICE)
         .eval()
     )
-    print(f"✅ Loaded RoBERTa from {MODEL_DIR}")
+    print(f"✅ Loaded RoBERTa from {MODEL_DIR}", file=sys.stderr)
 except Exception as e:
     print("❌ ERROR: loading RoBERTa model/tokenizer failed:", e, file=sys.stderr)
     sys.exit(1)
@@ -110,7 +104,7 @@ def cli_main(input_files: list[str], output_dir: Path):
 
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
         # 1) Detailed per‐sentence
-        df[["reference", "candidate", "precision", "recall", "f1"]] \
+        df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
 
         # 2) Single‐row averages
@@ -121,7 +115,7 @@ def cli_main(input_files: list[str], output_dir: Path):
         }]).round(6)
         summary.to_excel(writer, sheet_name="Model metrics", index=False)
 
-    print(f"✔️  Report saved to: {out_fp.resolve()}")
+    print(f"✔️ Report saved to: {out_fp.resolve()}", file=sys.stderr)
 
 
 if __name__ == "__main__":
