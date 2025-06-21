@@ -1,9 +1,11 @@
 def objective(trial):
+    # Hyperparameter search space
     batch_size       = trial.suggest_categorical('batch_size', [4, 8, 16, 32])
     learning_rate    = trial.suggest_float('learning_rate', 2e-5, 2e-1, log=True)
     num_train_epochs = trial.suggest_int('num_train_epochs', low=7, high=15)
     weight_decay     = trial.suggest_loguniform('weight_decay', 4e-3, 1e-1)
 
+    # Seq2Seq training arguments
     args = Seq2SeqTrainingArguments(
         output_dir="models/checkpoint_g.optuna_V2",
         eval_steps=100,
@@ -14,9 +16,11 @@ def objective(trial):
         weight_decay=weight_decay,
         save_total_limit=1,
         num_train_epochs=num_train_epochs,
-        predict_with_generate=True
+        predict_with_generate=True,
+        report_to="none"  # avoids wandb or tensorboard errors
     )
 
+    # Define the trainer
     trainer = Seq2SeqTrainer(
         model=model_name,
         args=args,
@@ -27,9 +31,16 @@ def objective(trial):
         compute_metrics=compute_metrics,
     )
 
-    trainer.train()
-    predictions = trainer.predict(tokenized_validation_dataset)
-    print("▶ Predictions:", predictions.metrics)
+    # Train the model
+    result = trainer.train()
 
-    # Use 'BLEU' instead of 'test_BLEU' based on your compute_metrics function
-    return predictions.metrics.get('BLEU', 0)
+    # Predict on validation set
+    predictions = trainer.predict(tokenized_validation_dataset)
+
+    # DEBUG: print the metrics returned
+    print("▶ Predictions.metrics:", predictions.metrics)
+
+    # Return BLEU score to Optuna
+    bleu = predictions.metrics.get('BLEU', 0)
+
+    return bleu
