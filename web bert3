@@ -1,59 +1,146 @@
+import os
+import tempfile
 import pandas as pd
-import torch
-import evaluate
-import traceback
+from typing import List, Dict
+import evaluate  # picks up your Local bertscore.py
 
-# ✅ Local paths
-MODEL_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
-BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# where model Lives on disk
+MODEL_PATH = os.getenv(
+    "BERT", 
+    "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large"
+)
+DEVICE = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+BASELINE_PATH = "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large/en/roberta-large.tsv"
 
-# ✅ Load custom local BERTScore metric
+# Load the metric defined in your bertscore.py
 try:
-    scorer = evaluate.load(r"C:/Users/ZKC7HOU/Documents/4. BERT score/bertscore")
-    print("✔ Loaded local BERTScore metric")
+    scorer = evaluate.load("bertscore")
+    print("Loaded local bertscore metric")
 except Exception as e:
-    print("❌ Failed to load BERTScore metric:", e)
+    print("Failed to load bertscore metric:", e)
     scorer = None
 
-# ✅ Scoring function
-def run_bertscore_on_excel(input_path: str, output_path: str):
+def calculate_bertscores(references: List[str], candidates: List[str]) -> Dict[str, List[float]]:
+    """Calculate BERT scores for given reference-candidate pairs.
+    
+    Args:
+        references: List of reference texts
+        candidates: List of candidate texts to score
+    
+    Returns:
+        Dictionary with precision, recall, and f1 scores
+    
+    Raises:
+        RuntimeError: If scorer failed to load
+        ValueError: If input lengths don't match
+        Exception: Any scoring errors
+    """
     if scorer is None:
-        raise RuntimeError("Metric failed to load")
+        raise RuntimeError("BERTScore metric failed to load")
+    if len(references) != len(candidates):
+        raise ValueError("reference and candidate lists must have the same length")
+
+    results = scorer.compute(
+        predictions=[str(x).strip() for x in candidates],
+        references=[str(x).strip() for x in references],
+        model_type=MODEL_PATH,
+        num_layers=17,
+        device=DEVICE,
+        rescale_with_baseline=True,
+        baseline_path=BASELINE_PATH,
+        lang="en"
+    )
+    
+    # Clip and round scores
+    return {
+        "precision": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["precision"]],
+        "recall": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["recall"]],
+        "f1": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["f1"]],
+        "model_type": "roberta-large",
+        "version": "0.3.12"
+    }
+
+def process_excel_file(input_path: str, output_path: str = None) -> pd.DataFrame:
+    """Process an Excel file with reference and candidate columns.
+    
+    Args:
+        input_path: Path to input Excel file
+        output_path: Optional path to save results (None returns DataFrame)
+    
+    Returns:
+        DataFrame with scores added
+    
+    Raises:
+        FileNotFoundError: If input file doesn't exist
+        ValueError: If required columns are missing
+        Exception: Any processing errors
+    """
+    if not os.path.exists(input_path):
+        raise FileNotFoundError(f"Input file not found: {input_path}")
 
     df = pd.read_excel(input_path)
-
+    
     for col in ("reference", "candidate"):
         if col not in df.columns:
-            raise ValueError(f"Missing required column: '{col}'")
+            raise ValueError(f"Excel must have '{col}' column")
 
-    references = df["reference"].astype(str).str.strip().tolist()
-    candidates = df["candidate"].astype(str).str.strip().tolist()
+    scores = calculate_bertscores(
+        references=df["reference"].tolist(),
+        candidates=df["candidate"].tolist()
+    )
 
-    try:
-        result = scorer.compute(
-            predictions=candidates,
-            references=references,
-            model_type=MODEL_PATH,         # 👈 Your local RoBERTa model
-            num_layers=17,
-            device=DEVICE,
-            rescale_with_baseline=True,
-            baseline_path=BASELINE_PATH,   # 👈 Your local .tsv
-            lang="en"
-        )
+    df["precision"] = scores["precision"]
+    df["recall"] = scores["recall"]
+    df["f1"] = scores["f1"]
 
-        df["precision"] = [round(min(max(p, 0.0), 1.0), 6) for p in result["precision"]]
-        df["recall"] = [round(min(max(r, 0.0), 1.0), 6) for r in result["recall"]]
-        df["f1"] = [round(min(max(f, 0.0), 1.0), 6) for f in result["f1"]]
-
+    if output_path:
         df.to_excel(output_path, index=False)
-        print(f"✅ BERTScore results saved to: {output_path}")
-    except Exception as e:
-        print(traceback.format_exc())
-        raise RuntimeError(f"Scoring failed: {e}")
+    
+    return df
 
-# ✅ Example usage
+def process_uploaded_file(file_object) -> str:
+    """Process an uploaded Excel file and return temp file path with results.
+    
+    Args:
+        file_object: File-like object containing Excel data
+    
+    Returns:
+        Path to temporary file with results
+    
+    Raises:
+        ValueError: If file is not Excel format
+        Exception: Any processing errors
+    """
+    # Create temp file for output
+    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+    tmp.close()  # Close so pandas can open it
+    
+    try:
+        df = process_excel_file(file_object, tmp.name)
+        return tmp.name
+    except Exception as e:
+        os.unlink(tmp.name)  # Clean up temp file on error
+        raise e
+
 if __name__ == "__main__":
-    input_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/input_data.xlsx"
-    output_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/output_data.xlsx"
-    run_bertscore_on_excel(input_file, output_file)
+    # Example usage
+    try:
+        # Single text pair example
+        scores = calculate_bertscores(
+            references=["This is a reference sentence."],
+            candidates=["This is a candidate sentence."]
+        )
+        print("Single pair scores:", scores)
+
+        # Batch processing example
+        input_excel = "/path/to/your/input.xlsx"
+        output_excel = "/path/to/your/output.xlsx"
+        
+        if os.path.exists(input_excel):
+            df = process_excel_file(input_excel, output_excel)
+            print(f"Processed {len(df)} rows, saved to {output_excel}")
+        else:
+            print(f"Input file not found: {input_excel}")
+
+    except Exception as e:
+        print("Error:", str(e))
