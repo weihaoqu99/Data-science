@@ -7,31 +7,29 @@ from pathlib import Path
 import pandas as pd
 import torch
 import torch.nn.functional as F
-import evaluate   # <-- HF-Evaluate
-
+import evaluate                     # HF-Evaluate
 from transformers import RobertaTokenizer, RobertaModel
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 
-# adjust these if you move things around:
-SCRIPT_PATH   = Path(__file__).resolve()                  # .../Automation_Scripts/bertscore.py
-SCRIPT_DIR    = SCRIPT_PATH.parent                         # .../Automation_Scripts
-MODEL_DIR     = Path(
-    os.getenv("BERT", 
+HERE         = Path(__file__).parent.resolve()
+SCRIPT_FILE  = HERE / "bertscore.py"   # <-- this file
+MODEL_DIR    = Path(
+    os.getenv("BERT",
               r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
 )
-BASELINE_PATH = Path(
+BASELINE_PTH = Path(
     os.getenv("BASELINE",
               r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv")
 )
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── LOAD CUSTOM METRIC ───────────────────────────────────────────────────
+# ─── LOAD THE CUSTOM METRIC ─────────────────────────────────────────────────
 
 try:
-    # point directly at this file, not the folder
+    # point *directly* at this .py file, not its folder
     scorer = evaluate.load(
-        path=str(SCRIPT_PATH),
+        path=str(SCRIPT_FILE),
         module_type="metric"
     )
     print("✅ Loaded local bertscore metric")
@@ -39,24 +37,23 @@ except Exception as e:
     print(f"❌ ERROR: failed to load bertscore metric: {e}", file=sys.stderr)
     scorer = None
 
-# ─── CLI ENTRYPOINT ────────────────────────────────────────────────────────
+# ─── CLI ENTRYPOINT ─────────────────────────────────────────────────────────
 
 def cli_main(input_files: list[str], output_dir: Path):
     if scorer is None:
-        print("❌ ERROR: scorer not loaded, aborting", file=sys.stderr)
+        print("❌ ERROR: bertscore metric not loaded; aborting", file=sys.stderr)
         sys.exit(1)
 
-    # 1) read & concat
+    # 1) read & concat all inputs
     dfs = []
     for fn in input_files:
         p = Path(fn)
-        suf = p.suffix.lower()
-        if suf in (".xls", ".xlsx"):
+        if p.suffix.lower() in (".xls", ".xlsx"):
             dfs.append(pd.read_excel(p))
-        elif suf == ".csv":
+        elif p.suffix.lower() == ".csv":
             dfs.append(pd.read_csv(p))
         else:
-            print(f"❌ ERROR: unsupported file type {suf}", file=sys.stderr)
+            print(f"❌ ERROR: unsupported file type {p.suffix}", file=sys.stderr)
             sys.exit(1)
 
     if not dfs:
@@ -64,13 +61,13 @@ def cli_main(input_files: list[str], output_dir: Path):
         sys.exit(1)
     df = pd.concat(dfs, ignore_index=True)
 
-    # 2) sanity check
+    # 2) verify columns
     for col in ("reference", "candidate"):
         if col not in df.columns:
             print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # 3) compute in one shot
+    # 3) compute all at once with our local metric
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -78,8 +75,8 @@ def cli_main(input_files: list[str], output_dir: Path):
         num_layers=17,
         device=DEVICE,
         rescale_with_baseline=True,
-        baseline_path=str(BASELINE_PATH),
-        lang="en"
+        baseline_path=str(BASELINE_PTH),
+        lang="en",
     )
 
     # 4) attach & write Excel
@@ -90,10 +87,11 @@ def cli_main(input_files: list[str], output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     out_fp = output_dir / "Bertscore_output.xlsx"
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # a) per‐sentence
+        # sheet 1: per-sentence
         df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
-        # b) macro averages
+
+        # sheet 2: single‐row averages
         summary = pd.DataFrame([{
             "precision": df["precision"].mean(),
             "recall":    df["recall"].mean(),
@@ -103,11 +101,12 @@ def cli_main(input_files: list[str], output_dir: Path):
 
     print(f"✔️ Report saved to: {out_fp.resolve()}")
 
+
 # ─── ARGPARSE BOILERPLATE ──────────────────────────────────────────────────
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Offline BERTScore CLI (local RoBERTa-large + baseline rescaling)"
+        description="Offline BERTScore CLI (local RoBERTa-large + baseline)"
     )
     parser.add_argument(
         "--output_dir",
