@@ -5,24 +5,21 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import evaluate  # will load this file itself as a metric
+import evaluate   # will load this file itself as the metric
 import torch
 import torch.nn.functional as F
 from transformers import RobertaTokenizer, RobertaModel
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-# This file lives in metrics_webapp/Automation_Scripts/, so its parent is the script folder:
-SCRIPT_DIR    = Path(__file__).parent
-# Use forward‐slashes (or raw strings) with no stray spaces:
+SCRIPT_DIR    = Path(__file__).parent.resolve()
 MODEL_DIR     = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
 BASELINE_PATH = MODEL_DIR / "roberta-large.tsv"
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-# ─── 1) Load this file itself as the bertscore metric ─────────────────────
+# ─── 1) Load this script as the bertscore metric ──────────────────────────
 try:
     scorer = evaluate.load(
-        path=str(SCRIPT_DIR.resolve()),
+        path=str(SCRIPT_DIR),
         module_type="metric"
     )
     print("✅ Loaded local bertscore metric")
@@ -30,8 +27,7 @@ except Exception as e:
     print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
     sys.exit(1)
 
-
-# ─── 2) Load the offline RoBERTa tokenizer + model ─────────────────────────
+# ─── 2) Load tokenizer + model ─────────────────────────────────────────────
 if not MODEL_DIR.is_dir():
     print(f"❌ ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
     sys.exit(1)
@@ -80,7 +76,7 @@ def cli_main(input_files: list[str], output_dir: Path):
             print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # ─── Compute BERTScore via this metric ──────────────────────────────────
+    # ─── Compute with our local bertscore metric ─────────────────────────────
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -101,11 +97,11 @@ def cli_main(input_files: list[str], output_dir: Path):
     out_fp = output_dir / "Bertscore_output.xlsx"
 
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # 1) per‐sentence
+        # 1) per‐sentence details
         df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
 
-        # 2) one‐row averages
+        # 2) single-row macro‐averages
         summary = pd.DataFrame([{
             "precision": df["precision"].mean(),
             "recall":    df["recall"].mean(),
@@ -124,7 +120,7 @@ if __name__ == "__main__":
         "--output_dir",
         type=Path,
         required=True,
-        help="Directory in which to write Bertscore_output.xlsx"
+        help="Directory to write Bertscore_output.xlsx"
     )
     parser.add_argument(
         "files",
@@ -134,3 +130,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cli_main(args.files, args.output_dir)
+    
+    
+    
