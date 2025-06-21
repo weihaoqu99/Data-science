@@ -5,69 +5,78 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import evaluate   # will load this file itself as the metric
 import torch
 import torch.nn.functional as F
 from transformers import RobertaTokenizer, RobertaModel
+import evaluate  # to load your local bertscore.py
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-SCRIPT_DIR    = Path(__file__).parent.resolve()
-MODEL_DIR     = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-BASELINE_PATH = MODEL_DIR / "roberta-large.tsv"
-DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
+# point these at your local model & .tsv baseline
+MODEL_DIR     = Path(os.getenv(
+    "BERT",
+    r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+))
+BASELINE_PATH = Path(os.getenv(
+    "BASELINE",
+    r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
+))
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── 1) Load this script as the bertscore metric ──────────────────────────
+# ─── 1) Load local bertscore metric ────────────────────────────────────────
 try:
+    METRIC_SCRIPT_DIR = Path(__file__).parent  # this folder
     scorer = evaluate.load(
-        path=str(SCRIPT_DIR),
+        path=str(METRIC_SCRIPT_DIR),
         module_type="metric"
     )
     print("✅ Loaded local bertscore metric")
 except Exception as e:
     print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
-    sys.exit(1)
+    scorer = None
 
-# ─── 2) Load tokenizer + model ─────────────────────────────────────────────
+# ─── 2) Load tokenizer + model ────────────────────────────────────────────
 if not MODEL_DIR.is_dir():
     print(f"❌ ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
     sys.exit(1)
 
 try:
     tokenizer = RobertaTokenizer.from_pretrained(
-        str(MODEL_DIR),
-        local_files_only=True,
-        use_fast=False
+        str(MODEL_DIR), local_files_only=True, use_fast=False
     )
     model = (
-        RobertaModel
-        .from_pretrained(str(MODEL_DIR), local_files_only=True)
+        RobertaModel.from_pretrained(str(MODEL_DIR), local_files_only=True)
         .to(DEVICE)
         .eval()
     )
-    print("✅ Loaded local RoBERTa-large")
 except Exception as e:
-    print("❌ ERROR: loading RoBERTa model/tokenizer failed:", e, file=sys.stderr)
+    print("❌ ERROR: loading local RoBERTa-large model/tokenizer failed:", e, file=sys.stderr)
     sys.exit(1)
 
 
 def cli_main(input_files: list[str], output_dir: Path):
+    if scorer is None:
+        print("❌ ERROR: scorer not loaded, aborting", file=sys.stderr)
+        sys.exit(1)
+
     # ─── Read & concatenate all inputs ──────────────────────────────────────
     dfs = []
     for fn in input_files:
         p = Path(fn)
         suf = p.suffix.lower()
-        if suf in (".xls", ".xlsx"):
-            dfs.append(pd.read_excel(p))
-        elif suf == ".csv":
-            dfs.append(pd.read_csv(p))
-        else:
-            print(f"❌ ERROR: unsupported file type {suf}", file=sys.stderr)
+        try:
+            if suf in (".xls", ".xlsx"):
+                dfs.append(pd.read_excel(p))
+            elif suf == ".csv":
+                dfs.append(pd.read_csv(p))
+            else:
+                raise ValueError(f"unsupported file type {suf}")
+        except Exception as e:
+            print(f"❌ ERROR reading {p}: {e}", file=sys.stderr)
             sys.exit(1)
 
     if not dfs:
         print("❌ ERROR: no data loaded", file=sys.stderr)
         sys.exit(1)
-
     df = pd.concat(dfs, ignore_index=True)
 
     # ─── Verify required columns ────────────────────────────────────────────
@@ -76,7 +85,7 @@ def cli_main(input_files: list[str], output_dir: Path):
             print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # ─── Compute with our local bertscore metric ─────────────────────────────
+    # ─── Compute BERTScore via your local metric ────────────────────────────
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -130,6 +139,5 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     cli_main(args.files, args.output_dir)
-    
     
     
