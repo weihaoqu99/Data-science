@@ -1,46 +1,58 @@
-
 import pandas as pd
 import torch
-import bert_score
-from pathlib import Path
+import evaluate
+import traceback
 
-# Local model and baseline path
+# ✅ Local paths
 MODEL_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
 BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# ✅ Load custom local BERTScore metric
+try:
+    scorer = evaluate.load(r"C:/Users/ZKC7HOU/Documents/4. BERT score/bertscore")
+    print("✔ Loaded local BERTScore metric")
+except Exception as e:
+    print("❌ Failed to load BERTScore metric:", e)
+    scorer = None
+
+# ✅ Scoring function
 def run_bertscore_on_excel(input_path: str, output_path: str):
+    if scorer is None:
+        raise RuntimeError("Metric failed to load")
+
     df = pd.read_excel(input_path)
 
     for col in ("reference", "candidate"):
         if col not in df.columns:
-            raise ValueError(f"Excel must contain columns: reference and candidate")
+            raise ValueError(f"Missing required column: '{col}'")
 
     references = df["reference"].astype(str).str.strip().tolist()
     candidates = df["candidate"].astype(str).str.strip().tolist()
 
-    # Compute BERTScore directly using bert_score library
-    P, R, F1 = bert_score.score(
-        cands=candidates,
-        refs=references,
-        lang="en",
-        model_type=MODEL_PATH,
-        num_layers=17,
-        device=DEVICE,
-        batch_size=32,
-        rescale_with_baseline=True,
-        baseline_path=BASELINE_PATH,
-        verbose=True,
-    )
+    try:
+        result = scorer.compute(
+            predictions=candidates,
+            references=references,
+            model_type=MODEL_PATH,         # 👈 Your local RoBERTa model
+            num_layers=17,
+            device=DEVICE,
+            rescale_with_baseline=True,
+            baseline_path=BASELINE_PATH,   # 👈 Your local .tsv
+            lang="en"
+        )
 
-    df["precision"] = [round(p.item(), 6) for p in P]
-    df["recall"] = [round(r.item(), 6) for r in R]
-    df["f1"] = [round(f.item(), 6) for f in F1]
+        df["precision"] = [round(min(max(p, 0.0), 1.0), 6) for p in result["precision"]]
+        df["recall"] = [round(min(max(r, 0.0), 1.0), 6) for r in result["recall"]]
+        df["f1"] = [round(min(max(f, 0.0), 1.0), 6) for f in result["f1"]]
 
-    df.to_excel(output_path, index=False)
-    print(f"✅ Results saved to: {output_path}")
+        df.to_excel(output_path, index=False)
+        print(f"✅ BERTScore results saved to: {output_path}")
+    except Exception as e:
+        print(traceback.format_exc())
+        raise RuntimeError(f"Scoring failed: {e}")
 
-# Example usage
+# ✅ Example usage
 if __name__ == "__main__":
     input_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/input_data.xlsx"
     output_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/output_data.xlsx"
