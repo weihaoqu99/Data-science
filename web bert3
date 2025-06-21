@@ -1,59 +1,9 @@
-import evaluate
-import numpy as np
-import bert_score
+import shutil
+import os
 
-_DESCRIPTION = "BERTScore metric using a local RoBERTa model"
-
-_CITATION = """\
-@inproceedings{zhang2019bertscore,
-  title={BERTScore: Evaluating Text Generation with BERT},
-  author={Zhang, Tianyi and Kishore, Varsha and Wu, Felix and Weinberger, Kilian Q and Artzi, Yoav},
-  booktitle={International Conference on Learning Representations},
-  year={2020}
-}
-"""
-
-class BERTScoreMetric(evaluate.Metric):
-    def _info(self):
-        return evaluate.MetricInfo(
-            description=_DESCRIPTION,
-            citation=_CITATION,
-            inputs_description="Compute BERTScore",
-            features=[
-                evaluate.features.Sequence(feature=evaluate.Value("string"), name="predictions"),
-                evaluate.features.Sequence(feature=evaluate.Value("string"), name="references"),
-            ],
-        )
-
-    def _compute(
-        self,
-        predictions,
-        references,
-        model_type="roberta-large",
-        num_layers=17,
-        device="cpu",
-        lang="en",
-        batch_size=32,
-        rescale_with_baseline=True,
-        baseline_path=None,
-        verbose=True,
-        idf=False,
-    ):
-        P, R, F1 = bert_score.score(
-            cands=predictions,
-            refs=references,
-            lang=lang,
-            model_type=model_type,
-            num_layers=num_layers,
-            device=device,
-            batch_size=batch_size,
-            rescale_with_baseline=rescale_with_baseline,
-            baseline_path=baseline_path,
-            verbose=verbose,
-            idf=idf
-        )
-        return {
-            "precision": P.tolist(),
-            "recall": R.tolist(),
-            "f1": F1.tolist()
-        }
+cache_path = os.path.expanduser("~/.cache/huggingface/metrics/bertscore")
+if os.path.exists(cache_path):
+    shutil.rmtree(cache_path)
+    print("✅ Cleared cached bertscore metric")
+else:
+    print("✅ No cache found to clear")
