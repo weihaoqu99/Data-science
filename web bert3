@@ -1,146 +1,60 @@
-import os
-import tempfile
-import pandas as pd
-from typing import List, Dict
-import evaluate  # picks up your Local bertscore.py
+# bertscore.py
+import evaluate
+import numpy as np
+import bert_score
 
-# where model Lives on disk
-MODEL_PATH = os.getenv(
-    "BERT", 
-    "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large"
-)
-DEVICE = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
-BASELINE_PATH = "/appdata/cortex/dev4/shared/libs/huggingface/roberta-large/en/roberta-large.tsv"
+_DESCRIPTION = "BERTScore metric using a local RoBERTa model"
 
-# Load the metric defined in your bertscore.py
-try:
-    scorer = evaluate.load("bertscore")
-    print("Loaded local bertscore metric")
-except Exception as e:
-    print("Failed to load bertscore metric:", e)
-    scorer = None
+_CITATION = """\
+@inproceedings{zhang2019bertscore,
+  title={BERTScore: Evaluating Text Generation with BERT},
+  author={Zhang, Tianyi and Kishore, Varsha and Wu, Felix and Weinberger, Kilian Q and Artzi, Yoav},
+  booktitle={International Conference on Learning Representations},
+  year={2020}
+}
+"""
 
-def calculate_bertscores(references: List[str], candidates: List[str]) -> Dict[str, List[float]]:
-    """Calculate BERT scores for given reference-candidate pairs.
-    
-    Args:
-        references: List of reference texts
-        candidates: List of candidate texts to score
-    
-    Returns:
-        Dictionary with precision, recall, and f1 scores
-    
-    Raises:
-        RuntimeError: If scorer failed to load
-        ValueError: If input lengths don't match
-        Exception: Any scoring errors
-    """
-    if scorer is None:
-        raise RuntimeError("BERTScore metric failed to load")
-    if len(references) != len(candidates):
-        raise ValueError("reference and candidate lists must have the same length")
-
-    results = scorer.compute(
-        predictions=[str(x).strip() for x in candidates],
-        references=[str(x).strip() for x in references],
-        model_type=MODEL_PATH,
-        num_layers=17,
-        device=DEVICE,
-        rescale_with_baseline=True,
-        baseline_path=BASELINE_PATH,
-        lang="en"
-    )
-    
-    # Clip and round scores
-    return {
-        "precision": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["precision"]],
-        "recall": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["recall"]],
-        "f1": [round(min(max(float(x), 0.0), 1.0), 6) for x in results["f1"]],
-        "model_type": "roberta-large",
-        "version": "0.3.12"
-    }
-
-def process_excel_file(input_path: str, output_path: str = None) -> pd.DataFrame:
-    """Process an Excel file with reference and candidate columns.
-    
-    Args:
-        input_path: Path to input Excel file
-        output_path: Optional path to save results (None returns DataFrame)
-    
-    Returns:
-        DataFrame with scores added
-    
-    Raises:
-        FileNotFoundError: If input file doesn't exist
-        ValueError: If required columns are missing
-        Exception: Any processing errors
-    """
-    if not os.path.exists(input_path):
-        raise FileNotFoundError(f"Input file not found: {input_path}")
-
-    df = pd.read_excel(input_path)
-    
-    for col in ("reference", "candidate"):
-        if col not in df.columns:
-            raise ValueError(f"Excel must have '{col}' column")
-
-    scores = calculate_bertscores(
-        references=df["reference"].tolist(),
-        candidates=df["candidate"].tolist()
-    )
-
-    df["precision"] = scores["precision"]
-    df["recall"] = scores["recall"]
-    df["f1"] = scores["f1"]
-
-    if output_path:
-        df.to_excel(output_path, index=False)
-    
-    return df
-
-def process_uploaded_file(file_object) -> str:
-    """Process an uploaded Excel file and return temp file path with results.
-    
-    Args:
-        file_object: File-like object containing Excel data
-    
-    Returns:
-        Path to temporary file with results
-    
-    Raises:
-        ValueError: If file is not Excel format
-        Exception: Any processing errors
-    """
-    # Create temp file for output
-    tmp = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-    tmp.close()  # Close so pandas can open it
-    
-    try:
-        df = process_excel_file(file_object, tmp.name)
-        return tmp.name
-    except Exception as e:
-        os.unlink(tmp.name)  # Clean up temp file on error
-        raise e
-
-if __name__ == "__main__":
-    # Example usage
-    try:
-        # Single text pair example
-        scores = calculate_bertscores(
-            references=["This is a reference sentence."],
-            candidates=["This is a candidate sentence."]
+class BERTScoreMetric(evaluate.Metric):
+    def _info(self):
+        return evaluate.MetricInfo(
+            description=_DESCRIPTION,
+            citation=_CITATION,
+            inputs_description="reference and candidate sentences",
+            features=[
+                evaluate.features.TextSequence("predictions"),
+                evaluate.features.TextSequence("references"),
+            ],
         )
-        print("Single pair scores:", scores)
 
-        # Batch processing example
-        input_excel = "/path/to/your/input.xlsx"
-        output_excel = "/path/to/your/output.xlsx"
-        
-        if os.path.exists(input_excel):
-            df = process_excel_file(input_excel, output_excel)
-            print(f"Processed {len(df)} rows, saved to {output_excel}")
-        else:
-            print(f"Input file not found: {input_excel}")
-
-    except Exception as e:
-        print("Error:", str(e))
+    def _compute(
+        self,
+        predictions,
+        references,
+        model_type="roberta-large",
+        num_layers=17,
+        device="cpu",
+        lang="en",
+        batch_size=32,
+        rescale_with_baseline=True,
+        baseline_path=None,
+        verbose=True,
+        idf=False,
+    ):
+        P, R, F1 = bert_score.score(
+            cands=predictions,
+            refs=references,
+            lang=lang,
+            model_type=model_type,
+            num_layers=num_layers,
+            device=device,
+            batch_size=batch_size,
+            rescale_with_baseline=rescale_with_baseline,
+            baseline_path=baseline_path,
+            verbose=verbose,
+            idf=idf
+        )
+        return {
+            "precision": P.tolist(),
+            "recall": R.tolist(),
+            "f1": F1.tolist()
+        }
