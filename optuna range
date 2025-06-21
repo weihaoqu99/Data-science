@@ -1,86 +1,35 @@
-import torch
-from transformers import T5ForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
-import optuna
-
-# re-declare device here
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 def objective(trial):
-    # ... your existing sampling code ...
+    batch_size       = trial.suggest_categorical('batch_size', [4, 8, 16, 32])
+    learning_rate    = trial.suggest_float('learning_rate', 2e-5, 2e-1, log=True)
+    num_train_epochs = trial.suggest_int('num_train_epochs', low=7, high=15)
+    weight_decay     = trial.suggest_loguniform('weight_decay', 4e-3, 1e-1)
 
-    # reload fresh base → now device is defined
-    base_madlad400 = T5ForConditionalGeneration \
-        .from_pretrained(base_madlad400_checkpoint) \
-        .to(device)
-
-    # rest of your code unchanged...
-
-
-import optuna
-from transformers import T5ForConditionalGeneration, Seq2SeqTrainingArguments, Seq2SeqTrainer
-
-def objective(trial):
-    # 1) sample hyperparameters
-    batch_size        = trial.suggest_categorical('batch_size',      [4, 8, 16, 32])
-    learning_rate     = trial.suggest_float(     'learning_rate', 2e-5, 2e-1, log=True)
-    num_train_epochs  = trial.suggest_int(       'num_train_epochs', 7,  15)
-    weight_decay      = trial.suggest_loguniform('weight_decay', 4e-3, 1e-1)
-
-    # 2) build the Trainer args
     args = Seq2SeqTrainingArguments(
-        output_dir                 = "./models/optuna_trial",
-        evaluation_strategy        = "steps",
-        eval_steps                 = 100,
-        learning_rate              = learning_rate,
-        per_device_train_batch_size= batch_size,
-        per_device_eval_batch_size = batch_size,
-        weight_decay               = weight_decay,
-        save_total_limit           = 1,
-        num_train_epochs           = num_train_epochs,
-        predict_with_generate      = True,
+        output_dir="models/checkpoint_g.optuna_V2",
+        eval_steps=100,
+        evaluation_strategy="epoch",
+        learning_rate=learning_rate,
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        weight_decay=weight_decay,
+        save_total_limit=1,
+        num_train_epochs=num_train_epochs,
+        predict_with_generate=True
     )
 
-    # 3) reload a fresh base + LoRA for each trial
-    base_madlad400 = T5ForConditionalGeneration \
-        .from_pretrained(base_madlad400_checkpoint).to(device)
-    for p in base_madlad400.parameters():
-        p.requires_grad = False
-        if p.ndim == 1:
-            p.data = p.data.to(torch.float32)
-    base_madlad400.gradient_checkpointing_enable()
-    base_madlad400.enable_input_require_grads()
-    base_madlad400.lm_head = CastOutputToFloat(base_madlad400.lm_head)
-
-    lora_model = get_peft_model(base_madlad400, lora_config)
-    model_name = lora_model
-
-    # 4) create and run the Trainer
     trainer = Seq2SeqTrainer(
-        model            = model_name,
-        args             = args,
-        train_dataset    = tokenized_train_dataset,
-        eval_dataset     = tokenized_validation_dataset,
-        data_collator    = data_collator,
-        tokenizer        = base_madlad400_tokenizer,
-        compute_metrics  = compute_metrics,
+        model=model_name,
+        args=args,
+        train_dataset=tokenized_train_dataset,
+        eval_dataset=tokenized_validation_dataset,
+        data_collator=data_collator,
+        tokenizer=base_madlad400_tokenizer,
+        compute_metrics=compute_metrics,
     )
+
     trainer.train()
+    predictions = trainer.predict(tokenized_validation_dataset)
+    print("▶ Predictions:", predictions.metrics)
 
-    # 5) evaluate on your validation set
-    preds = trainer.predict(tokenized_validation_dataset)
-    print("▶ metrics keys:", preds.metrics.keys())
-    val_bleu = preds.metrics.get('test_BLEU', 0.0)
-    print(f"▶ trial {trial.number} → test_BLEU = {val_bleu:.2f}")
-    return val_bleu
-
-# 6) Actually run the study
-study = optuna.create_study(
-    direction='maximize',
-    sampler=optuna.samplers.TPESampler(),
-    pruner=optuna.pruners.HyperbandPruner()
-)
-study.optimize(objective, n_trials=5)
-
-# 7) Print out the best found
-print("Best hyperparameters:", study.best_params)
-print("Best performance (BLEU):", study.best_value)
+    # Use 'BLEU' instead of 'test_BLEU' based on your compute_metrics function
+    return predictions.metrics.get('BLEU', 0)
