@@ -5,71 +5,46 @@ import argparse
 from pathlib import Path
 
 import pandas as pd
-import torch
-import torch.nn.functional as F
-from transformers import RobertaTokenizer, RobertaModel
 import evaluate
 
-# ─── PATHS & CONFIG ─────────────────────────────────────────────────────────
-ROOT = Path(__file__).parent.resolve()
+# ─── Configuration ─────────────────────────────────────────────────────────
 
-METRIC_SCRIPT_DIR = (ROOT / "Automation_Scripts").resolve()
-if not (METRIC_SCRIPT_DIR / "bertscore.py").is_file():
-    print(f"ERROR: can’t find Automation_Scripts/bertscore.py", file=sys.stderr)
-    sys.exit(1)
+# This script lives in metrics_webapp/Automation_Scripts/
+SCRIPT_DIR        = Path(__file__).parent
+MODEL_DIR         = Path(
+    os.getenv(
+        "BERT",
+        r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+    )
+)
+BASELINE_PATH     = Path(
+    os.getenv(
+        "BASELINE",
+        MODEL_DIR / "roberta-large.tsv"
+    )
+)
+DEVICE            = "cuda" if os.getenv("CUDA_VISIBLE_DEVICES") else "cpu"
 
-MODEL_DIR = Path(
-    os.getenv("BERT", "C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-).expanduser().resolve()
-if not MODEL_DIR.is_dir():
-    print(f"ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
-    sys.exit(1)
-
-BASELINE_PATH = (MODEL_DIR / "roberta-large.tsv").resolve()
-if not BASELINE_PATH.is_file():
-    print(f"ERROR: cannot find baseline TSV at {BASELINE_PATH}", file=sys.stderr)
-    sys.exit(1)
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-# ─── LOAD METRIC ─────────────────────────────────────────────────────────────
+# ─── Load your local bertscore metric ──────────────────────────────────────
 try:
     scorer = evaluate.load(
-        path=str(METRIC_SCRIPT_DIR),
+        path=str(SCRIPT_DIR),    # points at Automation_Scripts/bertscore.py
         module_type="metric"
     )
-    print(f"✅ Loaded local bertscore metric", file=sys.stderr)
+    print("✅ Loaded local bertscore metric")
 except Exception as e:
-    print("❌ ERROR loading bertscore metric:", e, file=sys.stderr)
+    print("❌ ERROR: failed to load bertscore metric:", e, file=sys.stderr)
     scorer = None
 
-
-# ─── LOAD RoBERTa ───────────────────────────────────────────────────────────
-try:
-    tokenizer = RobertaTokenizer.from_pretrained(
-        str(MODEL_DIR), local_files_only=True, use_fast=False
-    )
-    model = (
-        RobertaModel.from_pretrained(str(MODEL_DIR), local_files_only=True)
-        .to(DEVICE)
-        .eval()
-    )
-    print(f"✅ Loaded RoBERTa from {MODEL_DIR}", file=sys.stderr)
-except Exception as e:
-    print("❌ ERROR loading RoBERTa:", e, file=sys.stderr)
-    sys.exit(1)
-
-
-# ─── CLI ENTRYPOINT ─────────────────────────────────────────────────────────
-def cli_main(files: list[str], output_dir: Path):
+# ─── Main CLI function ─────────────────────────────────────────────────────
+def cli_main(input_files: list[str], output_dir: Path):
     if scorer is None:
-        print("ERROR: bertscore metric not loaded, aborting", file=sys.stderr)
+        print("❌ ERROR: scorer not loaded, aborting", file=sys.stderr)
         sys.exit(1)
 
-    # — read & concat all inputs —
+    # 1) read & concat
     dfs = []
-    for fn in files:
+    for fn in input_files:
         p = Path(fn)
         suf = p.suffix.lower()
         if suf in (".xls", ".xlsx"):
@@ -77,22 +52,20 @@ def cli_main(files: list[str], output_dir: Path):
         elif suf == ".csv":
             dfs.append(pd.read_csv(p))
         else:
-            print(f"ERROR: unsupported file type {p}", file=sys.stderr)
+            print(f"❌ ERROR: unsupported file type {suf}", file=sys.stderr)
             sys.exit(1)
-
     if not dfs:
-        print("ERROR: no data loaded", file=sys.stderr)
+        print("❌ ERROR: no data loaded", file=sys.stderr)
         sys.exit(1)
-
     df = pd.concat(dfs, ignore_index=True)
 
-    # — verify columns —
+    # 2) sanity‐check columns
     for col in ("reference", "candidate"):
         if col not in df.columns:
-            print(f"ERROR: missing required column '{col}'", file=sys.stderr)
+            print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # — compute with your local metric —
+    # 3) compute BERTScore in one shot
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -101,41 +74,44 @@ def cli_main(files: list[str], output_dir: Path):
         device=DEVICE,
         rescale_with_baseline=True,
         baseline_path=str(BASELINE_PATH),
-        lang="en",
+        lang="en"
     )
 
     df["precision"] = out["precision"]
     df["recall"]    = out["recall"]
     df["f1"]        = out["f1"]
 
-    # — write Excel with two sheets —
+    # 4) write Excel with two sheets
     output_dir.mkdir(parents=True, exist_ok=True)
     out_fp = output_dir / "Bertscore_output.xlsx"
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # 1) per‐sentence details
-        df[["reference", "candidate", "precision", "recall", "f1"]] \
+        # a) per‐sentence details
+        df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
-        # 2) one‐row macro‐avg
+        # b) single‐row macro averages
         summary = pd.DataFrame([{
             "precision": df["precision"].mean(),
             "recall":    df["recall"].mean(),
-            "f1":        df["f1"].mean(),
+            "f1":        df["f1"].mean()
         }]).round(6)
         summary.to_excel(writer, sheet_name="Model metrics", index=False)
 
-    print(f"✔️ Report saved to: {out_fp}", file=sys.stderr)
+    print(f"✔️  Report saved to: {out_fp.resolve()}")
 
-
+# ─── Entry point ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Offline BERTScore CLI (local RoBERTa-large + baseline rescale)"
+        description="Offline BERTScore CLI (local RoBERTa-large w/ baseline rescaling)"
     )
     parser.add_argument(
-        "--output_dir", type=Path, required=True,
+        "--output_dir",
+        type=Path,
+        required=True,
         help="Directory to write Bertscore_output.xlsx"
     )
     parser.add_argument(
-        "files", nargs="+",
+        "files",
+        nargs="+",
         help="One or more .csv/.xls/.xlsx files with 'reference' & 'candidate' columns"
     )
     args = parser.parse_args()
