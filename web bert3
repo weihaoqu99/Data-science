@@ -1,124 +1,64 @@
-#!/usr/bin/env python
-import os
-import sys
-import argparse
+import traceback
+import evaluate  # local bertscore.py
+import torch
+import pandas as pd
 from pathlib import Path
 
-import pandas as pd
-import torch
-import torch.nn.functional as F
-import evaluate                     # HF-Evaluate
-from transformers import RobertaTokenizer, RobertaModel
+# Set local model and baseline paths (no "en/" subfolder)
+MODEL_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
-
-HERE         = Path(__file__).parent.resolve()
-SCRIPT_FILE  = HERE / "bertscore.py"   # <-- this file
-MODEL_DIR    = Path(
-    os.getenv("BERT",
-              r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
-)
-BASELINE_PTH = Path(
-    os.getenv("BASELINE",
-              r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv")
-)
-DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-
-# ─── LOAD THE CUSTOM METRIC ─────────────────────────────────────────────────
-
+# Load BERTScore metric
 try:
-    # point *directly* at this .py file, not its folder
-    scorer = evaluate.load(
-        path=str(SCRIPT_FILE),
-        module_type="metric"
-    )
-    print("✅ Loaded local bertscore metric")
+    scorer = evaluate.load("bertscore")
+    print("✔ Loaded local BERTScore metric")
 except Exception as e:
-    print(f"❌ ERROR: failed to load bertscore metric: {e}", file=sys.stderr)
+    print("❌ Failed to load BERTScore metric:", e)
     scorer = None
 
-# ─── CLI ENTRYPOINT ─────────────────────────────────────────────────────────
-
-def cli_main(input_files: list[str], output_dir: Path):
+# BERTScore batch scoring from Excel
+def run_bertscore_on_excel(input_path: str, output_path: str):
     if scorer is None:
-        print("❌ ERROR: bertscore metric not loaded; aborting", file=sys.stderr)
-        sys.exit(1)
+        raise RuntimeError("Metric failed to load")
 
-    # 1) read & concat all inputs
-    dfs = []
-    for fn in input_files:
-        p = Path(fn)
-        if p.suffix.lower() in (".xls", ".xlsx"):
-            dfs.append(pd.read_excel(p))
-        elif p.suffix.lower() == ".csv":
-            dfs.append(pd.read_csv(p))
-        else:
-            print(f"❌ ERROR: unsupported file type {p.suffix}", file=sys.stderr)
-            sys.exit(1)
+    df = pd.read_excel(input_path)
 
-    if not dfs:
-        print("❌ ERROR: no data loaded", file=sys.stderr)
-        sys.exit(1)
-    df = pd.concat(dfs, ignore_index=True)
-
-    # 2) verify columns
     for col in ("reference", "candidate"):
         if col not in df.columns:
-            print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError(f"❌ Missing column: {col}")
 
-    # 3) compute all at once with our local metric
-    out = scorer.compute(
-        predictions=[c.strip() for c in df["candidate"].astype(str)],
-        references=[r.strip() for r in df["reference"].astype(str)],
-        model_type=str(MODEL_DIR),
-        num_layers=17,
-        device=DEVICE,
-        rescale_with_baseline=True,
-        baseline_path=str(BASELINE_PTH),
-        lang="en",
-    )
+    references = df["reference"].astype(str).str.strip().tolist()
+    candidates = df["candidate"].astype(str).str.strip().tolist()
 
-    # 4) attach & write Excel
-    df["precision"] = out["precision"]
-    df["recall"]    = out["recall"]
-    df["f1"]        = out["f1"]
+    if len(references) != len(candidates):
+        raise ValueError("❌ Length mismatch between reference and candidate columns")
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_fp = output_dir / "Bertscore_output.xlsx"
-    with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # sheet 1: per-sentence
-        df[["reference","candidate","precision","recall","f1"]] \
-          .to_excel(writer, sheet_name="Detailed metrics", index=False)
+    try:
+        result = scorer.compute(
+            predictions=candidates,
+            references=references,
+            model_type=MODEL_PATH,
+            num_layers=17,
+            device=DEVICE,
+            rescale_with_baseline=True,
+            baseline_path=BASELINE_PATH,
+            lang="en"
+        )
 
-        # sheet 2: single‐row averages
-        summary = pd.DataFrame([{
-            "precision": df["precision"].mean(),
-            "recall":    df["recall"].mean(),
-            "f1":        df["f1"].mean()
-        }]).round(6)
-        summary.to_excel(writer, sheet_name="Model metrics", index=False)
+        df["precision"] = [round(min(max(p, 0.0), 1.0), 6) for p in result["precision"]]
+        df["recall"] = [round(min(max(r, 0.0), 1.0), 6) for r in result["recall"]]
+        df["f1"] = [round(min(max(f, 0.0), 1.0), 6) for f in result["f1"]]
 
-    print(f"✔️ Report saved to: {out_fp.resolve()}")
+        df.to_excel(output_path, index=False)
+        print(f"✅ Results saved to: {output_path}")
 
+    except Exception as e:
+        print(traceback.format_exc())
+        raise RuntimeError(f"Scoring failed: {e}")
 
-# ─── ARGPARSE BOILERPLATE ──────────────────────────────────────────────────
-
+# Example Usage
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Offline BERTScore CLI (local RoBERTa-large + baseline)"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=Path,
-        required=True,
-        help="Directory to write Bertscore_output.xlsx"
-    )
-    parser.add_argument(
-        "files",
-        nargs="+",
-        help="One or more .csv/.xls/.xlsx files with 'reference' & 'candidate' columns"
-    )
-    args = parser.parse_args()
-    cli_main(args.files, args.output_dir)
-    
+    input_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/input_data.xlsx"
+    output_file = r"C:/Users/ZKC7HOU/Documents/4. BERT score/output_data.xlsx"
+    run_bertscore_on_excel(input_file, output_file)
