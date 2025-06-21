@@ -2,25 +2,24 @@
 import os
 import sys
 import argparse
-import traceback
 from pathlib import Path
 
 import pandas as pd
+import evaluate  # will load this file itself as a metric
 import torch
 import torch.nn.functional as F
 from transformers import RobertaTokenizer, RobertaModel
-import evaluate  # loads this file as a local metric module
 
 # ─── Configuration ─────────────────────────────────────────────────────────
-# SCRIPT_DIR is the directory containing this script (Automation_Scripts)
+# This file lives in metrics_webapp/Automation_Scripts/, so its parent is the script folder:
 SCRIPT_DIR    = Path(__file__).parent
-# Use forward‐slashes in your path string; Path will normalize on Windows
+# Use forward‐slashes (or raw strings) with no stray spaces:
 MODEL_DIR     = Path("C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large")
 BASELINE_PATH = MODEL_DIR / "roberta-large.tsv"
 DEVICE        = "cuda" if torch.cuda.is_available() else "cpu"
 
 
-# ─── 1) load your local bertscore metric (this file itself) ────────────────
+# ─── 1) Load this file itself as the bertscore metric ─────────────────────
 try:
     scorer = evaluate.load(
         path=str(SCRIPT_DIR.resolve()),
@@ -32,7 +31,7 @@ except Exception as e:
     sys.exit(1)
 
 
-# ─── 2) load the offline RoBERTa tokenizer + model ─────────────────────────
+# ─── 2) Load the offline RoBERTa tokenizer + model ─────────────────────────
 if not MODEL_DIR.is_dir():
     print(f"❌ ERROR: cannot find model folder at {MODEL_DIR}", file=sys.stderr)
     sys.exit(1)
@@ -49,9 +48,9 @@ try:
         .to(DEVICE)
         .eval()
     )
-    print("✅ Loaded local RoBERTa‐large model/tokenizer")
+    print("✅ Loaded local RoBERTa-large")
 except Exception as e:
-    print("❌ ERROR: loading local RoBERTa‐large model/tokenizer failed:", e, file=sys.stderr)
+    print("❌ ERROR: loading RoBERTa model/tokenizer failed:", e, file=sys.stderr)
     sys.exit(1)
 
 
@@ -62,17 +61,9 @@ def cli_main(input_files: list[str], output_dir: Path):
         p = Path(fn)
         suf = p.suffix.lower()
         if suf in (".xls", ".xlsx"):
-            try:
-                dfs.append(pd.read_excel(p))
-            except Exception as e:
-                print(f"❌ ERROR reading {p}: {e}", file=sys.stderr)
-                sys.exit(1)
+            dfs.append(pd.read_excel(p))
         elif suf == ".csv":
-            try:
-                dfs.append(pd.read_csv(p))
-            except Exception as e:
-                print(f"❌ ERROR reading {p}: {e}", file=sys.stderr)
-                sys.exit(1)
+            dfs.append(pd.read_csv(p))
         else:
             print(f"❌ ERROR: unsupported file type {suf}", file=sys.stderr)
             sys.exit(1)
@@ -89,7 +80,7 @@ def cli_main(input_files: list[str], output_dir: Path):
             print(f"❌ ERROR: missing required column '{col}'", file=sys.stderr)
             sys.exit(1)
 
-    # ─── Compute BERTScore via local metric ─────────────────────────────────
+    # ─── Compute BERTScore via this metric ──────────────────────────────────
     out = scorer.compute(
         predictions=[c.strip() for c in df["candidate"].astype(str)],
         references=[r.strip() for r in df["reference"].astype(str)],
@@ -110,11 +101,11 @@ def cli_main(input_files: list[str], output_dir: Path):
     out_fp = output_dir / "Bertscore_output.xlsx"
 
     with pd.ExcelWriter(out_fp, engine="xlsxwriter") as writer:
-        # 1) detailed per-sentence
-        df[["reference", "candidate", "precision", "recall", "f1"]] \
+        # 1) per‐sentence
+        df[["reference","candidate","precision","recall","f1"]] \
           .to_excel(writer, sheet_name="Detailed metrics", index=False)
 
-        # 2) one-row averages
+        # 2) one‐row averages
         summary = pd.DataFrame([{
             "precision": df["precision"].mean(),
             "recall":    df["recall"].mean(),
@@ -122,12 +113,12 @@ def cli_main(input_files: list[str], output_dir: Path):
         }]).round(6)
         summary.to_excel(writer, sheet_name="Model metrics", index=False)
 
-    print(f"✔️  Report saved to: {out_fp.resolve()}")
+    print(f"✔️ Report saved to: {out_fp.resolve()}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Offline BERTScore CLI (local RoBERTa-large w/ baseline rescoring)"
+        description="Offline BERTScore CLI (local RoBERTa-large + baseline rescaling)"
     )
     parser.add_argument(
         "--output_dir",
