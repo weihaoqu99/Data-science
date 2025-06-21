@@ -1,60 +1,33 @@
-# bertscore.py
 import evaluate
-import numpy as np
-import bert_score
+import torch
 
-_DESCRIPTION = "BERTScore metric using a local RoBERTa model"
+# Load your local BERTScore metric
+scorer = evaluate.load(r"C:/Users/ZKC7HOU/Documents/4. BERT score/bertscore")
 
-_CITATION = """\
-@inproceedings{zhang2019bertscore,
-  title={BERTScore: Evaluating Text Generation with BERT},
-  author={Zhang, Tianyi and Kishore, Varsha and Wu, Felix and Weinberger, Kilian Q and Artzi, Yoav},
-  booktitle={International Conference on Learning Representations},
-  year={2020}
-}
-"""
+# Define model path and baseline path
+MODEL_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large"
+BASELINE_PATH = r"C:/Users/ZKC7HOU/Documents/4. BERT score/roberta-large/roberta-large.tsv"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-class BERTScoreMetric(evaluate.Metric):
-    def _info(self):
-        return evaluate.MetricInfo(
-            description=_DESCRIPTION,
-            citation=_CITATION,
-            inputs_description="reference and candidate sentences",
-            features=[
-                evaluate.features.TextSequence("predictions"),
-                evaluate.features.TextSequence("references"),
-            ],
-        )
+# Input lists
+references = ["This is a reference sentence.", "Another test reference."]
+candidates = ["This is a candidate sentence.", "Another candidate version."]
 
-    def _compute(
-        self,
-        predictions,
-        references,
-        model_type="roberta-large",
-        num_layers=17,
-        device="cpu",
-        lang="en",
-        batch_size=32,
-        rescale_with_baseline=True,
-        baseline_path=None,
-        verbose=True,
-        idf=False,
-    ):
-        P, R, F1 = bert_score.score(
-            cands=predictions,
-            refs=references,
-            lang=lang,
-            model_type=model_type,
-            num_layers=num_layers,
-            device=device,
-            batch_size=batch_size,
-            rescale_with_baseline=rescale_with_baseline,
-            baseline_path=baseline_path,
-            verbose=verbose,
-            idf=idf
-        )
-        return {
-            "precision": P.tolist(),
-            "recall": R.tolist(),
-            "f1": F1.tolist()
-        }
+# Compute BERTScore
+result = scorer.compute(
+    predictions=candidates,
+    references=references,
+    model_type=MODEL_PATH,
+    num_layers=17,
+    device=DEVICE,
+    rescale_with_baseline=True,
+    baseline_path=BASELINE_PATH,
+    lang="en"
+)
+
+# Print results
+for i, (p, r, f) in enumerate(zip(result["precision"], result["recall"], result["f1"])):
+    print(f"\nPair {i+1}:")
+    print(f"  Precision: {round(p, 6)}")
+    print(f"  Recall   : {round(r, 6)}")
+    print(f"  F1 Score : {round(f, 6)}")
