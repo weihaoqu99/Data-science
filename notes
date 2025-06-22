@@ -1,3 +1,8 @@
+import sys, subprocess
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "transformers"])
+# then immediately restart your kernel (Runtime → Restart Kernel)
+
+
 Generation-Time Hyperparameters
 
 Parameter
