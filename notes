@@ -1,3 +1,17 @@
+
+
+curl -u YOUR_USERNAME:YOUR_APP_PASSWORD \
+  -X POST \
+  -H "Content-Type: application/json" \
+  https://scm.horizon.bankofamerica.com/rest/api/1.0/projects/CRFCC/repos \
+  -d '{
+        "name": "spanish-to-english-translation",
+        "scmId": "git",
+        "forkable": true,
+        "description": "Spanish → English translation service code"
+      }'
+
+
 pip uninstall -y numpy pandas
 pip install --no-cache-dir numpy pandas
 
