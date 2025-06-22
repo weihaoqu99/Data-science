@@ -11,6 +11,21 @@ curl -u YOUR_USERNAME:YOUR_APP_PASSWORD \
         "description": "Spanish → English translation service code"
       }'
 
+cd /c/python-git/ichassist_py_utility/metrics_calculation/metrics_webapp/Automation_Scripts
+
+# (If you haven’t already) turn it into a git repo:
+git init
+git add .
+git commit -m "Initial import of Automation_Scripts"
+
+# Point at your new remote:
+git remote add origin \
+  https://scm.horizon.bankofamerica.com/projects/CRFCC/repos/spanish-to-english-translation.git
+
+# Push up your main branch:
+git branch -M main        # rename to 'main' if needed
+git push -u origin main
+
 
 pip uninstall -y numpy pandas
 pip install --no-cache-dir numpy pandas
