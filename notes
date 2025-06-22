@@ -1,0 +1,71 @@
+save_strategy
+	•	Default: "no"
+	•	What it does: Controls when the Trainer writes model checkpoints.
+	•	"no" = never save (beyond the very end)
+	•	"steps" = save every save_steps
+	•	"epoch" = save at end of each epoch
+	•	Effect on translation: Doesn’t change model behavior, only your ability to roll back to an intermediate checkpoint. If you’re experimenting with many hyper-parameter settings, you might switch to "steps" so you can recover a “half-trained” model if something goes wrong.
+
+⸻
+
+2. save_steps
+	•	Default: 500
+	•	What it does: When save_strategy="steps", writes a checkpoint every save_steps training steps.
+	•	Effect on translation: None to the model itself. Lowering it (e.g. to 100) gives you finer-grained checkpoints at the cost of more I/O.
+
+⸻
+
+3. logging_strategy
+	•	Default: "steps"
+	•	What it does: Chooses whether to log training metrics by steps or by epoch.
+	•	Effect on translation: None to model quality—only how often you see loss/metric prints in your console or your Weights & Biases dashboard.
+
+⸻
+
+4. logging_steps
+	•	Default: 500
+	•	What it does: If logging_strategy="steps", logs metrics every logging_steps steps.
+	•	Effect on translation: None to training outcome; only to how often you get feedback in your logs.
+
+⸻
+
+5. metric_for_best_model
+	•	Default: None
+	•	What it does: When load_best_model_at_end=True, tells Trainer which validation metric to use to pick the “best” checkpoint (e.g. "bleu" or "chrf").
+	•	Effect on translation: If unset, you can’t auto-reload your best checkpoint. Setting it to "bleu" (or "chrF") ensures you finish with the model that actually scored highest on the metric you care about.
+
+⸻
+
+6. greater_is_better
+	•	Default: None
+	•	What it does: When metric_for_best_model is set, determines if a higher metric is better (True) or lower is better (False).
+	•	Effect on translation: Must be True for BLEU/chrF, so the Trainer knows “bigger is better.” If you leave it None, Trainer will guess based on metric name (but it’s safer to set it explicitly).
+
+⸻
+
+7. gradient_accumulation_steps
+	•	Default: 1
+	•	What it does: Accumulates gradients over this many forward passes before doing an optimizer step—effectively increasing your batch size without requiring more GPU RAM.
+	•	Effect on translation: A larger effective batch size often stabilizes training and can improve final BLEU/chrF scores—especially on small-GPU setups. Try values like 2 or 4 if you can’t fit a big per_device_train_batch_size.
+
+⸻
+
+8. optim
+	•	Default: "adamw_hf"
+	•	What it does: Chooses the optimizer:
+	•	"adamw_hf" → HuggingFace’s AdamW (default)
+	•	"adamw_torch" → PyTorch’s built-in AdamW
+	•	"adafactor" → Adafactor (lower memory, sometimes better for huge models)
+	•	Effect on translation: Different optimizers (and their default hyperparams) can converge to slightly different minima.
+	•	Adafactor is often recommended for very large models (e.g. 10⁹+ params) because it uses less memory and can sometimes yield smoother training.
+	•	AdamW (torch vs HF) rarely makes a huge BLEU difference, but if you’re troubleshooting odd learning-rate behavior, it’s one knob to twist.
+
+⸻
+
+TL;DR: None of these change the architecture or the way Spanish gets _encoded_→English decoded; they only control how and when training snapshots and logs get written, which metric the Trainer uses to pick “best,” and how the optimizer/gradient flow behaves. Of those, the most likely to impact your final BLEU/chrF scores are:
+	1.	gradient_accumulation_steps (effective batch size),
+	2.	optim (try adafactor for large-model stability),
+	3.	metric_for_best_model + greater_is_better (if you want to auto-select the true best on BLEU/chrF), and
+	4.	generation parameters (beams, length_penalty, no_repeat_ngram)—which you configure separately at predict_with_generate=True.
+
+
