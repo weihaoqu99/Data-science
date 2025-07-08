@@ -1,0 +1,221 @@
+1. Integrate the Metrics in Web App
+
+🎯 Goal:
+To develop a web-based application for evaluating Spanish–English translation models using BLEU, CHRF, CHRF++, and BERTScore. This allows internal teams to consistently benchmark translation quality and automate evaluation workflows.
+
+📐 Architecture:
+Users upload translation datasets through the web interface. The FastAPI backend routes the data to a metrics engine that calculates BLEU, CHRF, CHRF++, and BERTScore. Results are returned as downloadable Excel or JSON.
+
+🧰 Technologies Used:
+Python, FastAPI, HuggingFace, Pandas, Excel I/O, JupyterLab
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 2. Spanish LORA Finetuning with Bias Hyperparameters
+
+🎯 Goal:
+Improve translation performance by applying bias-aware hyperparameters during LORA model fine-tuning, tailored to IVR-style Spanish-to-English data.
+
+📐 Architecture:
+IVR data is tokenized and passed to a LORA-configured model with bias settings. The model is fine-tuned and evaluated using BLEU/BERTScore to confirm improvements over the base version.
+
+🧰 Technologies Used:
+Python, HuggingFace Transformers, PEFT, Optuna
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 3. Spanish LORA Finetuning with lora_dropout
+
+🎯 Goal:
+Enhance model generalization and reduce overfitting by introducing dropout in LORA fine-tuning for Spanish–English translations.
+
+📐 Architecture:
+The dataset is prepared and passed through a fine-tuning pipeline with lora_dropout applied. Model outputs are validated against prior versions for accuracy and consistency.
+
+🧰 Technologies Used:
+Python, Transformers, PyTorch, PEFT
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 4. Finetuning the Spanish Model with Hyperparameters
+
+🎯 Goal:
+Refine model accuracy by tuning various training parameters such as batch size, learning rate, and training epochs.
+
+📐 Architecture:
+The base model is trained using Optuna-generated hyperparameter sets. After training, evaluation scores are compared to select the best-performing configuration.
+
+🧰 Technologies Used:
+Python, HuggingFace Transformers, Optuna, Madlad
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 5. Spanish LORA Finetuning with Warmup Steps & Label Smoothing
+
+🎯 Goal:
+Stabilize training and reduce prediction confidence issues by applying warm-up steps and label smoothing to the training process.
+
+📐 Architecture:
+Tokenized input is fed into a LORA-based model with warm-up scheduler and label smoothing enabled. The model is fine-tuned and evaluated for improvements in precision and robustness.
+
+🧰 Technologies Used:
+Python, Transformers, PEFT, PyTorch
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 6. Finetuning the Spanish Model
+
+🎯 Goal:
+Apply new fine-tuning methods on existing Spanish–English models to achieve improved translation performance for IVR use cases.
+
+📐 Architecture:
+A dataset of IVR conversations is fine-tuned using a pre-trained base model. Performance metrics are used to validate the effectiveness of the updated training techniques.
+
+🧰 Technologies Used:
+Python, HuggingFace, Madlad, PyTorch
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 7. Enable Endpoint for Spanish Model
+
+🎯 Goal:
+Deploy the fine-tuned Spanish translation model as a REST API for seamless system integration.
+
+📐 Architecture:
+FastAPI is used to expose the model via a /translate endpoint. Incoming Spanish text is tokenized and passed to the model. Translated English text is returned as a response.
+
+🧰 Technologies Used:
+Python, FastAPI, HuggingFace Transformers
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 8. Evaluation Library & BERT Score Changes
+
+🎯 Goal:
+Upgrade the internal evaluation library with the latest BERTScore and CHRF++ computation logic to ensure alignment with modern Transformer models.
+
+📐 Architecture:
+Reference and predicted text are processed using the updated scoring logic. Outputs are written in structured formats (Excel, JSON) for reporting and integration.
+
+🧰 Technologies Used:
+Python, BERTScore, evaluate, CHRF++, BLEU
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 9. Latency / Response Time Evaluation – Madlad vs Helsinki
+
+🎯 Goal:
+Determine the better-performing model in terms of latency and translation accuracy between Madlad and Helsinki.
+
+📐 Architecture:
+Each model processes the same test dataset. Latency and BLEU/CHRF scores are logged and compared to select the more optimal model for production use.
+
+🧰 Technologies Used:
+Python, HuggingFace, BLEU, CHRF++, BERTScore
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 10. Refine the Training Data of Spanish Model
+
+🎯 Goal:
+Enhance the dataset by adding domain-specific terms from the BAC glossary to improve translation accuracy on financial vocabulary.
+
+📐 Architecture:
+The training dataset is enriched with glossary terms (e.g., IRA, Zelle). The updated dataset is fine-tuned and evaluated to determine performance improvements.
+
+🧰 Technologies Used:
+Python, Pandas, Tokenizer, Madlad
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 11. CPS MRM Support
+
+🎯 Goal:
+Ensure the CPS summarization model adheres to MRM (Model Risk Management) guidelines by analyzing failure logs and accuracy.
+
+📐 Architecture:
+Logs are reviewed against ground truth. Root causes for discrepancies are identified, and MRM-compliant reporting is generated for tracking.
+
+🧰 Technologies Used:
+Python, Log Analysis, Documentation
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 12. Merged LORA Model with Tokenizer
+
+🎯 Goal:
+Create a production-ready model by merging adapter weights into the base model and bundling it with the tokenizer.
+
+📐 Architecture:
+Using merge_and_unload(), the adapter and base model are combined. The tokenizer is saved with the model, ensuring reproducibility and consistency in deployment.
+
+🧰 Technologies Used:
+Python, PEFT, Transformers
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 13. IVR Test Data for Spanish
+
+🎯 Goal:
+Validate that Spanish IVR test scripts produce expected translations and understand intent correctly.
+
+📐 Architecture:
+Test cases are run through the model. Generated outputs are validated against expected answers to verify model reliability and fluency.
+
+🧰 Technologies Used:
+Python, CSV/Excel, Manual Validation
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 14. CPS Model Evaluation
+
+🎯 Goal:
+Evaluate CPS (Call Purpose Summarization) models for accuracy, hallucination control, and one-liner summary quality.
+
+📐 Architecture:
+Real customer-agent dialogue turns are summarized by the CPS model. Results are benchmarked for beam accuracy, hallucination rates, and clarity of the generated one-liner summaries.
+
+🧰 Technologies Used:
+Python, NLP Metrics, Conversation Data
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 15. Spanish Model Evaluation
+
+🎯 Goal:
+Build a Python library to standardize evaluation of Spanish translation outputs using BLEU, CHRF, and CHRF++ metrics.
+
+📐 Architecture:
+The user provides reference and predicted translations. The library computes all metrics and returns structured results. This helps in automated comparison of model performance.
+
+🧰 Technologies Used:
+Python, BLEU, CHRF, CHRF++, Pandas
+👤 End User: Erica at Bank of America
+
+⸻
+
+✅ 16. Onboarding Document
+
+🎯 Goal:
+Update the internal onboarding guide to reflect new workflows, tools, libraries, and configurations introduced across translation and evaluation pipelines.
+
+📐 Architecture:
+Legacy documents were reviewed, and revised with new tools, setup steps, and usage guides to ensure smooth onboarding for new team members.
+
+🧰 Technologies Used:
+Markdown, Word, Confluence/Wiki
+👤 End User: Erica at Bank of America
