@@ -1,0 +1,198 @@
+Technical Report
+
+Project: Spanish-to-English Neural Machine Translation – LoRA Fine-Tuning, Evaluation, and Deployment
+Author: [Your Name / Team]
+Date: [Insert Date]
+
+⸻
+
+1. Introduction
+
+This report documents the end-to-end development of a Spanish-to-English neural machine translation (NMT) system using LoRA fine-tuning.
+The work focused on improving translation accuracy for domain-specific and conversational text and creating a comprehensive evaluation and deployment pipeline.
+
+The main components of this project are:
+	1.	Fine-tuning models using LoRA techniques
+	2.	Experimentation with hyperparameters using Optuna
+	3.	Automated evaluation using BLEU, chrF/chrF++, and BERTScore
+	4.	Development of APIs for translation and evaluation
+	5.	Latency benchmarking and deployment readiness
+
+⸻
+
+2. Objectives and Motivation
+
+Motivation
+	•	Why improve Spanish-to-English translation?
+Many off-the-shelf models perform poorly for specialized domains such as finance, call center conversations, and IVR data. The translations lacked fluency and consistency, which directly impacts downstream tasks.
+	•	Goal:
+	•	Improve translation accuracy
+	•	Provide a consistent automated evaluation pipeline
+	•	Build a deployable API-based solution
+
+⸻
+
+3. Models Used
+
+3.1 Helsinki-NLP (MarianMT)
+
+This model served as the primary baseline. It is optimized for high-quality Spanish↔English translations.
+
+3.2 MADLAD 400 3B MT
+
+The MADLAD multilingual model was also fine-tuned.
+This model supports multiple languages and was chosen to see if multilingual pretraining offers an advantage.
+
+Both models were downloaded and stored locally (MADLAD saved in a dedicated models folder for use during training and inference).
+
+⸻
+
+4. Methodology
+
+4.1 LoRA Fine-Tuning
+
+LoRA Variants
+	•	RA LoRA (Residual Adaptation) – applied to Helsinki model
+	•	RS LoRA (Residual Scaling) – applied to MADLAD model
+
+Parameters Explored
+	•	Rank: 8, 16, 32, 64, 128, 256, 512
+	•	Alpha: 8, 16, 32, 64, 128, 256, 512
+	•	Warmup Steps: 100, 500, 1000
+	•	Label Smoothing: 0.0, 0.1, 0.2
+	•	LoRA dropout and bias configurations also tested.
+
+Automation
+
+The Optuna library was used to systematically search through the parameter space to find the best configurations.
+
+⸻
+
+4.2 Evaluation Metrics
+
+Custom Evaluation Library
+
+A custom library was developed to compute:
+	•	R-BLEU
+	•	chrF
+	•	chrF++
+
+These metrics compare reference translations and candidate translations across different test datasets.
+
+BERTScore
+	•	Model: RoBERTa-large from Hugging Face
+	•	Library: Hugging Face evaluate library
+	•	Metrics:
+	•	Precision
+	•	Recall
+	•	F1-score
+
+The F1-score was the primary metric used to evaluate semantic similarity.
+
+⸻
+
+4.3 Types of Data Evaluated
+
+The evaluation pipeline was applied to:
+	1.	1000 transformer consumer records
+	2.	749 IVR HL transformer prediction records
+
+This ensured that the model was tested across different types of real-world data.
+
+⸻
+
+4.4 API Development
+
+Two main endpoints were developed:
+	1.	Spanish-to-English Translation Endpoint
+	•	Provides real-time translation using fine-tuned Helsinki and MADLAD models.
+	2.	BERTScore Evaluation Endpoint
+	•	Accepts reference and candidate text inputs and returns precision, recall, and F1-score.
+
+These endpoints were integrated into a web application to allow automated evaluation and translation.
+
+⸻
+
+4.5 Latency and GPU Utilization
+	•	Latency measurements were carried out for both MADLAD and Helsinki models.
+	•	GPU resources:
+	•	Multiple GPUs (0, 1, 2, and 3) were used based on configuration.
+	•	Results showed that the Helsinki model had lower latency than MADLAD.
+
+⸻
+
+5. Experiments
+
+The experiments can be grouped into these major steps:
+	1.	Hyperparameter Sweeps
+	•	Conducted systematic experiments for rank and alpha values (8–512).
+	2.	Effect of Bias and Dropout
+	•	Explored bias parameters and LoRA dropout options.
+	3.	Label Smoothing and Warmup Steps
+	•	Experimented with different label smoothing values and warmup step configurations.
+	4.	Comparative Latency Evaluation
+	•	Benchmarked the time taken for translations between MADLAD and Helsinki.
+	5.	Dataset-Specific Evaluations
+	•	Evaluated all metrics on consumer data and IVR HL data.
+
+⸻
+
+6. Key Findings
+
+Best Hyperparameters
+	•	Helsinki:
+	•	RA LoRA True
+	•	Rank = 256, Alpha = 32
+	•	Warmup Steps = 500, Label Smoothing = 0.1
+	•	MADLAD:
+	•	RS LoRA True
+	•	Rank = 256, Alpha = 64
+
+⸻
+
+Evaluation Results (Final Models)
+
+Helsinki:
+	•	BLEU: 30+
+	•	chrF: 54%
+	•	BERTScore (F1): 0.88 (Precision and Recall also calculated)
+
+MADLAD:
+	•	BLEU: +8 over baseline
+	•	chrF: 50%
+	•	BERTScore (F1): 0.86
+
+Latency:
+	•	Helsinki model is faster and more suitable for deployment.
+
+⸻
+
+7. Contributions
+	•	Designed and fine-tuned RA and RS LoRA models for Spanish-to-English translation.
+	•	Built a translation evaluation library for BLEU, chrF, and chrF++ metrics.
+	•	Implemented BERTScore API endpoint using RoBERTa-large for semantic evaluation.
+	•	Created a Spanish-to-English translation API endpoint.
+	•	Integrated these endpoints in a web app for automated evaluation.
+	•	Conducted latency benchmarking and GPU resource optimization.
+	•	Performed large-scale evaluation on 1000 consumer records and 749 IVR HL prediction records.
+
+⸻
+
+8. Outcome and Future Work
+	•	The Helsinki RA LoRA fine-tuned model has been selected for production deployment due to superior accuracy and speed.
+	•	Future enhancements:
+	•	Model ensembling (combining Helsinki and MADLAD models).
+	•	Active learning and incremental updates with new data.
+	•	Adding COMET metric and human evaluation.
+
+⸻
+
+9. Conclusion
+
+This project delivered:
+	•	Improved translation accuracy through fine-tuning with LoRA
+	•	Automated evaluation pipelines for translation quality
+	•	Web-based API endpoints for translation and evaluation
+	•	Latency-optimized, GPU-enabled deployment
+
+The combination of high-quality evaluation, hyperparameter optimization, and API deployment ensures the system is robust and production-ready
