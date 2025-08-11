@@ -14,3 +14,8 @@ def compute_metrics(pred):
     wer = jiwer.wer(label_str, pred_str) * 100
 
     return {"wer": wer}
+
+
+
+print(vectorized_datasets)
+print(vectorized_datasets["train"][0].keys())   # should show: dict_keys(['input_features','labels'])
