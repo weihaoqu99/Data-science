@@ -111,3 +111,40 @@ def prepare_dataset(batch):
     batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
     batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
     return batch
+
+
+
+# --- put this in the VERY FIRST cell, before any `datasets` import ---
+import sys, types, importlib, importlib.machinery, importlib.util
+
+# create a stub that satisfies datasets' probes
+sf_stub = types.ModuleType("soundfile")
+sf_stub.__spec__ = importlib.machinery.ModuleSpec("soundfile", loader=None)
+sf_stub.__libsndfile_version__ = "0.0.0"   # <-- exact name expected by datasets
+sf_stub.libsndfile_version = "0.0.0"       # (some versions check this too)
+sys.modules["soundfile"] = sf_stub
+
+# ensure find_spec("soundfile") returns a spec
+_orig_find_spec = importlib.util.find_spec
+def _fake_find_spec(name, package=None):
+    if name == "soundfile":
+        return importlib.machinery.ModuleSpec("soundfile", loader=None)
+    return _orig_find_spec(name, package)
+importlib.util.find_spec = _fake_find_spec
+
+# optional pure-Python decoders
+%pip install -q librosa audioread
+
+from datasets import Dataset, Audio
+import librosa
+
+# build WITHOUT decoding; decode in map()
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}) \
+             .cast_column("audio", Audio(decode=False))
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]
+    array, _ = librosa.load(path, sr=16000, mono=True)
+    batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
