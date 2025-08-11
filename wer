@@ -315,3 +315,6 @@ vectorized_datasets = raw_datasets.map(
     desc="Preparing dataset"
 )
 
+
+
+import subprocess; subprocess.run(["ffmpeg","-version"])
