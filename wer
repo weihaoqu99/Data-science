@@ -39,3 +39,36 @@ set_audio_backend("librosa")
 
 raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}) \
              .cast_column("audio", Audio(sampling_rate=16_000))
+
+
+
+# ---- put this at the very top of the notebook ----
+import sys, types
+sf_stub = types.ModuleType("soundfile")
+sf_stub.__spec__ = None
+sf_stub.libsndfile_version = "0.0.0"  # forces features that require libsndfile to be disabled
+sys.modules["soundfile"] = sf_stub
+
+# deps purely in Python
+%pip install -q librosa audioread
+
+# now it's safe to import datasets without crashing
+from datasets import Dataset, Audio
+import librosa
+
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}) \
+             .cast_column("audio", Audio(decode=False))
+raw_datasets = raw.train_test_split(test_size=0.15, seed=91)
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]
+    array, sr = librosa.load(path, sr=16000, mono=True)
+    batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=8
+)
