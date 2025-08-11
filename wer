@@ -148,3 +148,7 @@ def prepare_dataset(batch):
     batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
     batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
     return batch
+
+
+# conda (recommended)
+conda install -c conda-forge libsndfile ffmpeg soundfile librosa audioread
