@@ -205,3 +205,18 @@ assert hasattr(mod, "__libsndfile_version__"), "stub missing __libsndfile_versio
 
 
 
+
+
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}) \
+             .cast_column("audio", Audio(decode=False))
+
+raw_datasets = raw.train_test_split(test_size=0.15, seed=91)
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]
+    array, _ = librosa.load(path, sr=16000, mono=True)
+    batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+
