@@ -152,3 +152,26 @@ def prepare_dataset(batch):
 
 # conda (recommended)
 conda install -c conda-forge libsndfile ffmpeg soundfile librosa audioread
+# --- STUB SOUNDFILE (no libsndfile needed) ---
+import sys, types, importlib, importlib.machinery, importlib.util
+
+# if a previous bad stub exists, remove it
+sys.modules.pop("soundfile", None)
+
+# make a minimal stub with the attributes datasets probes
+sf_stub = types.ModuleType("soundfile")
+sf_stub.__spec__ = importlib.machinery.ModuleSpec("soundfile", loader=None)
+sf_stub.__file__ = "<soundfile-stub>"
+sf_stub.__package__ = ""
+sf_stub.__libsndfile_version__ = "0.0.0"   # <— EXACT NAME REQUIRED
+sf_stub.libsndfile_version = "0.0.0"       # some versions also check this
+sys.modules["soundfile"] = sf_stub
+
+# make importlib.util.find_spec('soundfile') return a spec (not None)
+_orig_find_spec = importlib.util.find_spec
+def _safe_find_spec(name, package=None):
+    if name == "soundfile":
+        return sf_stub.__spec__
+    return _orig_find_spec(name, package)
+importlib.util.find_spec = _safe_find_spec
+
