@@ -72,3 +72,42 @@ vectorized_datasets = raw_datasets.map(
     remove_columns=raw_datasets.column_names["train"],
     num_proc=8
 )
+
+
+
+# ---- put this at the very top of the notebook, before any datasets import ----
+import sys, types, importlib, importlib.machinery, importlib.util
+
+# create a stub module with a valid spec and the attribute datasets probes
+sf_stub = types.ModuleType("soundfile")
+sf_stub.__dict__.update({
+    "__spec__": importlib.machinery.ModuleSpec("soundfile", loader=None),
+    "libsndfile_version": "0.0.0",   # make the probe evaluate safely
+})
+sys.modules["soundfile"] = sf_stub
+
+# ensure find_spec("soundfile") returns a spec instead of raising
+_orig_find_spec = importlib.util.find_spec
+def _fake_find_spec(name, package=None):
+    if name == "soundfile":
+        return importlib.machinery.ModuleSpec("soundfile", loader=None)
+    return _orig_find_spec(name, package)
+importlib.util.find_spec = _fake_find_spec
+
+# optional: use librosa for decoding later
+%pip install -q librosa audioread
+
+from datasets import Dataset, Audio
+import librosa
+
+# build dataset WITHOUT decoding; decode with librosa in map()
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
+    "audio", Audio(decode=False)
+)
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]
+    array, sr = librosa.load(path, sr=16000, mono=True)
+    batch["input_features"] = processor.feature_extractor(array, sampling_rate=16000).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
