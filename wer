@@ -175,3 +175,33 @@ def _safe_find_spec(name, package=None):
     return _orig_find_spec(name, package)
 importlib.util.find_spec = _safe_find_spec
 
+# --- SOUNDFILE STUB: must run before importing `datasets` ---
+import sys, types, importlib, importlib.machinery, importlib.util
+
+# remove any previously loaded soundfile
+sys.modules.pop("soundfile", None)
+
+# create stub with the exact attributes `datasets` expects
+_sf = types.ModuleType("soundfile")
+_sf.__spec__ = importlib.machinery.ModuleSpec("soundfile", loader=None)
+_sf.__file__ = "<soundfile-stub>"
+_sf.__package__ = ""
+_sf.__libsndfile_version__ = "0.0.0"   # EXACT attribute name required
+_sf.libsndfile_version = "0.0.0"       # some versions also check this
+sys.modules["soundfile"] = _sf
+
+# keep original find_spec, then patch safely (to avoid recursion)
+_orig_find_spec = importlib.util.find_spec
+def _safe_find_spec(name, package=None):
+    if name == "soundfile":
+        return _sf.__spec__
+    return _orig_find_spec(name, package)
+importlib.util.find_spec = _safe_find_spec
+
+# quick self-check
+import importlib as _il
+mod = _il.import_module("soundfile")
+assert hasattr(mod, "__libsndfile_version__"), "stub missing __libsndfile_version__"
+
+
+
