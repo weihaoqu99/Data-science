@@ -1,3 +1,9 @@
+
+
+
+
+
+
 import jiwer
 
 def compute_metrics(pred):
@@ -220,3 +226,39 @@ def prepare_dataset(batch):
     return batch
 
 
+
+from datasets import Dataset, Audio
+import librosa
+
+# 1) Build WITHOUT decoding (very important)
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
+    "audio", Audio(decode=False)
+)
+
+# 2) Split and force plain Python format so printing doesn’t decode
+raw_datasets = raw.train_test_split(test_size=0.15, seed=91)
+raw_datasets = raw_datasets.with_format("python")
+
+
+# Don’t do: [r["sentence"] for r in raw_datasets["test"]]  # triggers decoding
+print(raw_datasets["test"]["sentence"][:10])                # SAFE (column access)
+
+# or drop the audio column before looking at rows:
+print(raw_datasets["test"].remove_columns("audio")[:3])     # SAFE
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]                     # path only; not decoded
+    array, _ = librosa.load(path, sr=16000, mono=True)
+    batch["input_features"] = processor.feature_extractor(
+        array, sampling_rate=16000
+    ).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=8
+)
+
+print(vectorized_datasets["train"][0].keys())  # should be dict_keys(['input_features','labels'])
