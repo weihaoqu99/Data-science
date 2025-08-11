@@ -18,4 +18,24 @@ def compute_metrics(pred):
 
 
 print(vectorized_datasets)
-print(vectorized_datasets["train"][0].keys())   # should show: dict_keys(['input_features','labels'])
+print(vectorized_datasets["train"][0].keys())   # 
+
+
+should show: dict_keys(['input_features','labels'])
+
+
+
+
+from datasets.features.audio import set_audio_backend
+set_audio_backend("librosa")   # put this BEFORE you call .cast_column(...)
+
+
+pip install librosa audioread
+# (ffmpeg is recommended so audioread can decode mp3)
+
+from datasets import Dataset, Audio
+from datasets.features.audio import set_audio_backend
+set_audio_backend("librosa")
+
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}) \
+             .cast_column("audio", Audio(sampling_rate=16_000))
