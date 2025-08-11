@@ -262,3 +262,56 @@ vectorized_datasets = raw_datasets.map(
 )
 
 print(vectorized_datasets["train"][0].keys())  # should be dict_keys(['input_features','labels'])
+
+
+
+
+
+import numpy as np, audioread, resampy
+
+def load_audio_ar(path: str, sr: int = 16000) -> tuple[np.ndarray, int]:
+    """Decode audio via audioread (FFmpeg/MediaFoundation/CoreAudio),
+    convert to mono float32 in [-1,1], and resample to `sr`."""
+    with audioread.audio_open(path) as f:
+        sr_native = f.samplerate
+        ch = f.channels
+
+        # concatenate raw PCM chunks
+        pcm = b"".join(b for b in f)
+
+    # audioread gives 16-bit PCM for MP3/WAV → int16 → float32
+    y = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+
+    # deinterleave → mono
+    if ch > 1:
+        y = y.reshape(-1, ch).mean(axis=1)
+
+    # resample if needed
+    if sr_native != sr:
+        y = resampy.resample(y, sr_native, sr)
+
+    return y, sr
+
+def prepare_dataset(batch):
+    path = batch["audio"]["path"]                 # path only; not decoded
+    array, _ = load_audio_ar(path, sr=16000)      # <-- use audioread loader
+    batch["input_features"] = processor.feature_extractor(
+        array, sampling_rate=16000
+    ).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+from datasets import Dataset, Audio
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
+    "audio", Audio(decode=False)
+)
+raw_datasets = raw.train_test_split(test_size=0.15, seed=91).with_format("python")
+
+# Also avoid multiprocessing (workers re-import audio stacks):
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1,                      # <- important
+    desc="Preparing dataset"
+)
+
