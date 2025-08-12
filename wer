@@ -49,7 +49,30 @@ vectorized_datasets = raw_datasets.map(
     num_proc=1,
     desc="Preparing dataset",
 )
+bad = []
 
+def prepare_dataset_safe(batch):
+    path = batch["audio"]["path"]
+    try:
+        y, _ = load_mp3(path, target_sr=16000)
+    except Exception as e:
+        bad.append((path, str(e)))
+        return {"_bad": True}
+    return {
+        "input_features": processor.feature_extractor(y, sampling_rate=16000).input_features[0],
+        "labels": processor.tokenizer(batch["sentence"]).input_ids
+    }
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset_safe,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1,
+    desc="Preparing dataset",
+).filter(lambda ex: not ex.get("_bad", False))
+
+print("Skipped files:", len(bad))
+for p, err in bad[:5]:
+    print(" -", p, "->", err)
 
 
 
