@@ -1,3 +1,23 @@
+import os
+
+FOLDER = "/appdata/cortex/dev1/OrigAudio/one_particular_folder"  # <- change me
+
+def get_path(row):
+    # works for either schema: {'audio_path': ...} OR {'audio': {'path': ...}}
+    return row["audio_path"] if "audio_path" in row else row["audio"]["path"]
+
+train_list = [get_path(r) for r in raw_datasets["train"] if get_path(r).startswith(FOLDER)]
+test_list  = [get_path(r) for r in raw_datasets["test"]  if get_path(r).startswith(FOLDER)]
+
+print("=== TRAIN ===")
+print("\n".join(train_list) or "(none)")
+print("\n=== TEST ===")
+print("\n".join(test_list) or "(none)")
+
+
+
+
+
 # 0) Build the base dataset called `raw`
 from pathlib import Path
 from datasets import Dataset
