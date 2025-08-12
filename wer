@@ -1,3 +1,16 @@
+FOLDER = "/appdata/cortex/dev1/OrigAudio/one_particular_folder"  # or leave as "" to list all
+
+def get_path(row):
+    return row["audio_path"] if "audio_path" in row else row["audio"]["path"]
+
+train_paths = [p for p in (get_path(r) for r in raw_datasets["train"]) if p.startswith(FOLDER)]
+test_paths  = [p for p in (get_path(r) for r in raw_datasets["test"])  if p.startswith(FOLDER)]
+
+print("=== TRAIN ==="); print("\n".join(train_paths) or "(none)")
+print("\n=== TEST ===");  print("\n".join(test_paths)  or "(none)")
+
+
+
 import os
 
 FOLDER = "/appdata/cortex/dev1/OrigAudio/one_particular_folder"  # <- change me
