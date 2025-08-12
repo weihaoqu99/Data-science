@@ -1,3 +1,35 @@
+import os, re
+from datasets import DatasetDict
+
+# parse leading number like "001-" / "01-" / "139-"
+def _lead_num(path: str):
+    m = re.match(r"^(\d+)-", os.path.basename(path))
+    return int(m.group(1)) if m else None
+
+def _is_test(ex):
+    n = _lead_num(ex["audio_path"])
+    return (n is not None) and (1 <= n <= 139)
+
+# split with filters (like your photo)
+test_ds  = raw.filter(_is_test)
+train_ds = raw.filter(lambda ex: not _is_test(ex))
+
+raw_datasets = DatasetDict({"train": train_ds, "test": test_ds})
+print(raw_datasets)  # sanity check
+# DatasetDict({
+#   train: Dataset({ num_rows: ... })
+#   test:  Dataset({ num_rows: ... })
+# })
+
+# (re)vectorize exactly like you do later
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets["train"].column_names,  # ['audio_path','sentence']
+    num_proc=1,                                         # keep single process
+    desc="Preparing dataset",
+)
+
+
 from pathlib import Path
 import re, shutil
 
