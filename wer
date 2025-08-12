@@ -1,3 +1,34 @@
+# 0) Build the base dataset called `raw`
+from pathlib import Path
+from datasets import Dataset
+import glob, os, re
+
+SRC = "/appdata/cortex/dev1/OrigAudio"   # <- your mp3 root
+
+# list all mp3 paths
+audio_files = sorted(set(
+    glob.glob(f"{SRC}/**/*.mp3", recursive=True) +
+    glob.glob(f"{SRC}/**/*.MP3", recursive=True)
+))
+
+# if you already have `transcripts`, keep it; else derive from filename:
+def retrieve_transcript(p: str) -> str:
+    b = os.path.basename(p)
+    if b.lower().endswith(".mp3"): b = b[:-4]
+    d = b.find("-")
+    s = b[d+1:] if d != -1 else b
+    s = s.replace("_"," ").replace("."," ").replace("dont","don't").replace("shell","she'll")
+    return s.capitalize().replace(" i ", " I ")
+
+transcripts = [retrieve_transcript(p) for p in audio_files]
+
+# raw = single Dataset with paths + text (NOT datasets.Audio)
+raw = Dataset.from_dict({"audio_path": audio_files, "sentence": transcripts}).with_format("python")
+print(raw)  # sanity check
+
+
+
+
 import os, re
 from datasets import DatasetDict
 
