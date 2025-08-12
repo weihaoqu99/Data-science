@@ -1,3 +1,53 @@
+from datasets import Dataset
+
+raw = Dataset.from_dict({
+    "audio_path": audio_files,      # <-- string paths, not Audio(...)
+    "sentence":   transcripts
+})
+raw_datasets = raw.train_test_split(test_size=0.15, seed=91).with_format("python")
+
+# pip install miniaudio numpy
+import numpy as np, miniaudio
+
+def load_mp3(path: str, target_sr: int = 16000):
+    sb = miniaudio.decode_file(path)                      # floats in [-1,1]
+    sr_native = getattr(sb, "sample_rate", 16000)
+    ch        = getattr(sb, "channels",    1)
+    y = np.asarray(sb.samples, dtype=np.float32)
+    if ch > 1:
+        y = y.reshape(-1, ch).mean(axis=1)               # stereo -> mono
+    if sr_native != target_sr:
+        n_new = int(len(y) * target_sr / sr_native)
+        y = np.interp(
+            np.linspace(0, len(y), n_new, endpoint=False),
+            np.arange(len(y), dtype=np.float32),
+            y.astype(np.float32)
+        ).astype(np.float32)
+    return y, target_sr
+
+
+
+from transformers import WhisperProcessor
+
+# make sure whisper_loc is set to your model folder or HF id
+processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
+
+def prepare_dataset(batch):
+    path = batch["audio_path"]                      # <-- use string path
+    y, _ = load_mp3(path, target_sr=16000)          # miniaudio decoder
+    batch["input_features"] = processor.feature_extractor(
+        y, sampling_rate=16000
+    ).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1,                                     # keep single process
+    desc="Preparing dataset",
+)
+
 import numpy as np, miniaudio
 
 def load_mp3_miniaudio(path: str, target_sr: int = 16000):
