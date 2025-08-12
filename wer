@@ -1,3 +1,54 @@
+import numpy as np, miniaudio
+
+def load_mp3_miniaudio(path: str, target_sr: int = 16000):
+    sb = miniaudio.decode_file(path)   # decodes to floats in [-1, 1]
+    # be robust to field names
+    sr_native = getattr(sb, "sample_rate", getattr(sb, "samplerate", 16000))
+    ch        = getattr(sb, "channels",    getattr(sb, "nchannels", 1))
+    y = np.asarray(sb.samples, dtype=np.float32)
+
+    # stereo -> mono
+    if ch and ch > 1:
+        y = y.reshape(-1, ch).mean(axis=1)
+
+    # simple resample to 16k if needed
+    if sr_native != target_sr:
+        n_new = int(len(y) * target_sr / sr_native)
+        y = np.interp(
+            np.linspace(0, len(y), n_new, endpoint=False),
+            np.arange(len(y), dtype=np.float32),
+            y.astype(np.float32)
+        ).astype(np.float32)
+
+    return y, target_sr
+
+from transformers import WhisperProcessor
+
+# make sure whisper_loc is defined earlier (local folder or HF id)
+processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
+
+def prepare_dataset(batch):
+    # We stored paths only, so read from disk here:
+    path = batch["audio"]["path"]
+    y, _ = load_mp3_miniaudio(path, target_sr=16000)
+
+    batch["input_features"] = processor.feature_extractor(
+        y, sampling_rate=16000
+    ).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+# IMPORTANT: keep a single process so workers don’t re-import audio stacks
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1,                          # ← this avoids backend/import issues
+    desc="Preparing dataset",
+)
+
+
+
+
 from datasets import Dataset, Audio
 
 raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
