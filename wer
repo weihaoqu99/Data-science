@@ -1,3 +1,24 @@
+import os
+
+TO_EXCLUDE = "03-shell-carp.mp3"
+
+def keep_row(ex):
+    return os.path.basename(ex["audio_path"]) != TO_EXCLUDE
+
+# remove it from both splits
+raw_datasets = raw_datasets.filter(keep_row)
+
+# (re)vectorize
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1,
+    desc="Preparing dataset",
+)
+
+# then:
+trainer.train()
+
 from datasets import Dataset
 
 raw = Dataset.from_dict({
