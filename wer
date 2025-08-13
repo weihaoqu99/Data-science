@@ -1,3 +1,13 @@
+from transformers.trainer_callback import TrainerCallback
+
+class PrintEvalCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics:
+            nice = {k: round(float(v), 4) for k, v in metrics.items() if isinstance(v, (int, float))}
+            print(f"\n[Eval @ step {state.global_step}] {nice}")
+
+trainer.add_callback(PrintEvalCallback())
+
 # --- pure-Python word error rate (no dependencies) ---
 def _levenshtein(a, b):
     # a, b: lists of tokens
