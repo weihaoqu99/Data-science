@@ -1,3 +1,81 @@
+# ==== ONE-CELL, PATH-LESS, NO-SOUNDFILE/LIBROSA/TORCHAUDIO ====
+import sys, subprocess, importlib, wave, os, shutil
+import numpy as np
+import torch
+from transformers import pipeline
+
+# ---------------- EDIT ME ----------------
+mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"
+# model = ...        # your preloaded model
+# processor = ...    # your preloaded processor
+# ----------------------------------------
+
+# 1) Ensure imageio-ffmpeg is available and get the bundled ffmpeg binary path
+def ensure_imageio_ffmpeg():
+    try:
+        import imageio_ffmpeg
+    except Exception:
+        # install into the current kernel env
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "imageio-ffmpeg"], check=True)
+        import imageio_ffmpeg
+    return imageio_ffmpeg.get_ffmpeg_exe()
+
+ffmpeg_bin = ensure_imageio_ffmpeg()
+print("Using ffmpeg at:", ffmpeg_bin)
+
+# 2) Determine target sampling rate from your processor (fallback 16k)
+target_sr = getattr(getattr(processor, "feature_extractor", None), "sampling_rate", 16000)
+
+# 3) Convert MP3 -> temp WAV (mono, target_sr) using that exact ffmpeg binary
+tmp_wav = mp3_path + ".tmp.16k.wav"
+subprocess.run(
+    [ffmpeg_bin, "-y", "-i", mp3_path, "-ac", "1", "-ar", str(target_sr), "-f", "wav", tmp_wav],
+    check=True
+)
+
+# 4) Read WAV via stdlib (no external audio libs)
+with wave.open(tmp_wav, "rb") as wf:
+    sr = wf.getframerate()
+    nframes = wf.getnframes()
+    sampwidth = wf.getsampwidth()
+    nch = wf.getnchannels()
+    audio_bytes = wf.readframes(nframes)
+
+# We asked ffmpeg to write 16-bit PCM
+if sampwidth != 2:
+    raise RuntimeError(f"Expected 16-bit WAV, got sampwidth={sampwidth}")
+
+audio = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+if nch > 1:
+    audio = audio.reshape(-1, nch).mean(axis=1).astype(np.float32)
+
+# 5) HF ASR pipeline with YOUR model
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,
+    stride_length_s=(4, 2),
+)
+
+# 6) Transcribe & print text
+out = pipe({"array": audio, "sampling_rate": sr})
+print(out["text"])
+
+# 7) Cleanup temp WAV (optional)
+try:
+    os.remove(tmp_wav)
+except OSError:
+    pass
+
+
+
+
+
+
 import shutil; print(shutil.which("ffmpeg"))
 
 # ===================== EDIT ME =====================
