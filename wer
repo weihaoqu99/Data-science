@@ -1,3 +1,29 @@
+# Install system + Python dependencies from inside Jupyter
+!apt-get update -y && apt-get install -y libsndfile1 ffmpeg
+!pip install -U librosa audioread soundfile
+
+import librosa
+from transformers import pipeline
+import torch
+
+# Load MP3 (mono, 16 kHz)
+mp3_path = "/appdata/cortex/dev1/kzhne7me/whisper_training/sample_for_synthetic.mp3"
+audio, sr = librosa.load(mp3_path, sr=16000, mono=True)
+
+# Whisper ASR pipeline
+asr = pipeline(
+    "automatic-speech-recognition",
+    model="openai/whisper-small",  # or your fine-tuned model
+    device=0 if torch.cuda.is_available() else -1,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+)
+
+result = asr({"array": audio, "sampling_rate": sr})
+print(result["text"])
+
+
+
+
 import librosa, audioread, subprocess, sys
 print("librosa:", librosa.__version__, "at", librosa.__file__)
 print("ffmpeg:", subprocess.check_output(["ffmpeg","-version"]).decode().splitlines()[0])
