@@ -1,3 +1,22 @@
+import librosa
+from transformers import pipeline
+
+# 1) Load MP3 with librosa (mono, 16k, optional segment)
+path = "/appdata/cortex/dev1/03-shell_carp_on_it_if_you_let_her.mp3"
+y, sr = librosa.load(path, sr=16000, mono=True, offset=0.0, duration=None)
+
+# 2) Run ASR
+asr = pipeline(
+    "automatic-speech-recognition",
+    model="openai/whisper-small",
+    device=0,                    # set to -1 if no GPU
+    torch_dtype="auto"
+)
+
+result = asr({"array": y, "sampling_rate": sr})
+print(result["text"])
+
+
 import torch
 import torchaudio
 from torchaudio.transforms import Resample
