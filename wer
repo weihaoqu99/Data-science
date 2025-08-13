@@ -1,3 +1,90 @@
+# --- Live table of Step | Train Loss | Val Loss | WER during trainer.train() ---
+
+from transformers.trainer_callback import TrainerCallback
+
+class LiveMetricsTable(TrainerCallback):
+    def __init__(self):
+        # step -> {'step':int, 'train':float|None, 'val':float|None, 'wer':float|None}
+        self.rows = {}
+        self._printed_header = False
+
+    def _row(self, step):
+        step = int(step)
+        if step not in self.rows:
+            self.rows[step] = {"step": step, "train": None, "val": None, "wer": None}
+        return self.rows[step]
+
+    def _print_header_once(self):
+        if not self._printed_header:
+            hdr = f"{'Step':>8} | {'Train Loss':>12} | {'Val Loss':>10} | {'WER %':>7}"
+            print(hdr)
+            print("-" * len(hdr))
+            self._printed_header = True
+
+    # logs from training (contains 'loss')
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not logs or "loss" not in logs:
+            return
+        row = self._row(state.global_step)
+        row["train"] = float(logs["loss"])
+
+    # metrics from evaluation (contains eval_loss and eval_wer/wer)
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if not metrics:
+            return
+        row = self._row(state.global_step)
+
+        # HF sometimes prefixes with "eval_"
+        if "eval_loss" in metrics:
+            row["val"] = float(metrics["eval_loss"])
+        elif "loss" in metrics:
+            row["val"] = float(metrics["loss"])
+
+        if "eval_wer" in metrics:
+            row["wer"] = float(metrics["eval_wer"])
+        elif "wer" in metrics:
+            row["wer"] = float(metrics["wer"])
+
+        # print the row when we have eval results
+        self._print_header_once()
+        tl = f"{row['train']:.4f}" if row["train"] is not None else "-"
+        vl = f"{row['val']:.4f}"   if row["val"]   is not None else "-"
+        wr = f"{row['wer']:.2f}"   if row["wer"]   is not None else "-"
+        print(f"{row['step']:8d} | {tl:>12} | {vl:>10} | {wr:>7}")
+
+# attach the callback
+live = LiveMetricsTable()
+trainer.add_callback(live)
+
+# IMPORTANT: make sure eval actually runs during training
+# (you likely already set these in your TrainingArguments)
+# evaluation_strategy="steps", eval_steps=50,
+# logging_strategy="steps", logging_steps=25,
+# predict_with_generate=True, remove_unused_columns=False
+
+# train and still get a final table after training
+trainer.train()
+
+# optional: print a final consolidated table sorted by step
+if live.rows:
+    print("\nFinal summary:")
+    hdr = f"{'Step':>8} | {'Train Loss':>12} | {'Val Loss':>10} | {'WER %':>7}"
+    print(hdr); print("-"*len(hdr))
+    for s in sorted(live.rows):
+        r = live.rows[s]
+        tl = f"{r['train']:.4f}" if r["train"] is not None else "-"
+        vl = f"{r['val']:.4f}"   if r["val"]   is not None else "-"
+        wr = f"{r['wer']:.2f}"   if r["wer"]   is not None else "-"
+        print(f"{s:8d} | {tl:>12} | {vl:>10} | {wr:>7}")
+
+
+
+
+
+
+
+
+
 from transformers import TrainerCallback
 from tabulate import tabulate
 
