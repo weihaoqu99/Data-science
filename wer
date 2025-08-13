@@ -1,4 +1,37 @@
-# Install system + Python dependencies from inside Jupyter
+#
+
+import librosa
+from transformers import pipeline
+import torch
+
+path = "/appdata/cortex/dev1/03-shell_carp_on_it_if_you_let_her.mp3"
+
+try:
+    # force librosa to avoid soundfile (we removed it) and use audioread
+    audio, sr = librosa.load(path, sr=16000, mono=True)
+except Exception as e:
+    raise RuntimeError(
+        "MP3 decoding failed because this environment has no MP3 backend "
+        "(no ffmpeg/sox/gstreamer). Convert the file to WAV outside this "
+        "environment and try again."
+    ) from e
+
+asr = pipeline(
+    "automatic-speech-recognition",
+    model="openai/whisper-small",
+    device=0 if torch.cuda.is_available() else -1,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+)
+
+print(asr({"array": audio, "sampling_rate": sr})["text"])
+
+
+
+
+
+
+
+Install system + Python dependencies from inside Jupyter
 !apt-get update -y && apt-get install -y libsndfile1 ffmpeg
 !pip install -U librosa audioread soundfile
 
