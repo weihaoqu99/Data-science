@@ -6,6 +6,15 @@ print(raw_datasets["train"].features)  # should show Audio(..., decode=False)
 # Access will now return a dict with a 'path' key; no decoding happens.
 
 
+
+def to_path(ex):
+    return {"audio_path": ex["audio"]["path"]}
+
+raw_datasets = raw_datasets.map(to_path, remove_columns=["audio"])
+print(raw_datasets["train"].features)  # 'audio_path': Value('string')
+
+
+
 from pathlib import Path
 import shutil
 
