@@ -47,6 +47,55 @@ print(result["text"])
 
 
 
+# --- deps (no librosa / no soundfile)
+import torch
+import torchaudio
+from transformers import pipeline
+
+# --- your preloaded model & processor
+# model = ...
+# processor = ...
+
+# target sampling rate from your processor (fallback 16k)
+target_sr = getattr(getattr(processor, "feature_extractor", None), "sampling_rate", 16000)
+
+# --- load MP3 with torchaudio
+mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"
+wave, sr = torchaudio.load(mp3_path)           # wave: [channels, time], dtype=float32/-1..1
+
+# mono
+if wave.size(0) > 1:
+    wave = wave.mean(dim=0, keepdim=True)
+
+# resample if needed
+if sr != target_sr:
+    resampler = torchaudio.transforms.Resample(orig_freq=sr, new_freq=target_sr)
+    wave = resampler(wave)
+
+# to 1D numpy for the pipeline
+audio = wave.squeeze(0).cpu().numpy()
+
+# --- build ASR pipeline with your model
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,
+    stride_length_s=(4, 2),
+)
+
+# --- transcribe & print
+result = pipe({"array": audio, "sampling_rate": target_sr})
+print(result["text"])
+
+
+
+
+
+
 import torch
 import librosa
 from transformers import pipeline
