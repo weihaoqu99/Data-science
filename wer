@@ -1,3 +1,36 @@
+from pathlib import Path
+import shutil
+
+# ===== settings =====
+OUT = Path("/appdata/cortex/dev1/export_split")  # where to save train/ and test/
+PRESERVE_TREE = True                              # keep source subfolders
+COMMON_ROOT = Path("/appdata/cortex/dev1/OrigAudio")  # used only if PRESERVE_TREE
+# ====================
+
+def _src_path(row):
+    # works whether your dataset has 'audio_path' OR 'audio' (Audio(decode=False))
+    return row.get("audio_path") or row["audio"]["path"]
+
+def _save_split(split_name: str):
+    out_dir = OUT / split_name
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for row in raw_datasets[split_name]:
+        src = Path(_src_path(row))
+        if PRESERVE_TREE and COMMON_ROOT in src.parents:
+            dst = out_dir / src.relative_to(COMMON_ROOT)   # keep subfolder structure
+            dst.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            dst = out_dir / src.name                       # flat folder; keep filename
+        if not dst.exists():
+            shutil.copy2(src, dst)
+
+# run
+_save_split("train")
+_save_split("test")
+print(f"Saved: {OUT / 'train'} and {OUT / 'test'}")
+
+
 FOLDER = "/appdata/cortex/dev1/OrigAudio/one_particular_folder"  # or leave as "" to list all
 
 def get_path(row):
