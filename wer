@@ -1,3 +1,154 @@
+# ===================== EDIT ME =====================
+mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"  # your MP3
+# Your OWN already-loaded model & processor (keep your existing objects)
+# model = ...
+# processor = ...
+# ==================================================
+
+import os, sys, shutil, subprocess
+import numpy as np
+import torch
+from transformers import pipeline
+
+# model/processor sampling rate (fallback 16k)
+target_sr = getattr(getattr(globals().get("processor", None), "feature_extractor", None), "sampling_rate", 16000)
+
+def _resample_np_mono(x: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
+    """Pure-NumPy linear resample (no scipy/torchaudio). x is mono float32 [-1,1]."""
+    if sr_in == sr_out: 
+        return x.astype(np.float32, copy=False)
+    n_out = int(round(len(x) * sr_out / sr_in))
+    # Guard tiny/empty inputs
+    if n_out <= 1 or len(x) <= 1:
+        return x.astype(np.float32, copy=False)
+    t_in  = np.linspace(0.0, len(x) / sr_in, num=len(x), endpoint=False, dtype=np.float64)
+    t_out = np.linspace(0.0, len(x) / sr_out, num=n_out,  endpoint=False, dtype=np.float64)
+    y = np.interp(t_out, t_in, x.astype(np.float64))
+    return y.astype(np.float32)
+
+def _try_torchaudio(path: str):
+    try:
+        import torchaudio
+    except Exception as e:
+        return None, None, f"torchaudio not available: {e}"
+    try:
+        wav, sr = torchaudio.load(path)  # [C, T]
+        if wav.ndim != 2 or wav.size(0) == 0:
+            return None, None, "torchaudio: invalid shape"
+        # to mono
+        if wav.size(0) > 1:
+            wav = wav.mean(dim=0, keepdim=False)
+        else:
+            wav = wav.squeeze(0)
+        wav = wav.detach().cpu().float().numpy()  # float32 in [-1,1]
+        wav = _resample_np_mono(wav, sr, target_sr)
+        return wav, target_sr, None
+    except Exception as e:
+        return None, None, f"torchaudio failed: {e}"
+
+def _try_librosa(path: str):
+    try:
+        import librosa
+    except Exception as e:
+        return None, None, f"librosa not available: {e}"
+    try:
+        # Force pure audioread backend (avoids soundfile)
+        audio, sr = librosa.load(path, sr=None, mono=True, backend="audioread")
+        # librosa may give float64; ensure float32
+        audio = audio.astype(np.float32, copy=False)
+        audio = _resample_np_mono(audio, sr, target_sr)
+        return audio, target_sr, None
+    except Exception as e:
+        return None, None, f"librosa(audioread) failed: {e}"
+
+def _find_ffmpeg():
+    # Allow explicit override
+    if "FFMPEG_BIN" in os.environ and os.path.isfile(os.environ["FFMPEG_BIN"]):
+        return os.environ["FFMPEG_BIN"]
+    cand = shutil.which("ffmpeg")
+    if cand:
+        return cand
+    candidates = [
+        "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", os.path.expanduser("~/.local/bin/ffmpeg"),
+        "/opt/homebrew/bin/ffmpeg",  # mac (arm)
+        os.path.join(sys.prefix, "bin", "ffmpeg"),            # conda/env
+        os.path.join(sys.prefix, "Library", "bin", "ffmpeg"), # conda-win
+        r"C:\ffmpeg\bin\ffmpeg.exe", r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+    return None
+
+def _try_ffmpeg(path: str):
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        return None, None, "ffmpeg not found from Python (set FFMPEG_BIN env or add to PATH)"
+    try:
+        cmd = [
+            ffmpeg, "-i", path,
+            "-f", "s16le", "-acodec", "pcm_s16le",
+            "-ac", "1", "-ar", str(target_sr),
+            "-hide_banner", "-loglevel", "error",
+            "pipe:1"
+        ]
+        proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE)
+        audio_i16 = np.frombuffer(proc.stdout, dtype=np.int16)
+        if audio_i16.size == 0:
+            return None, None, "ffmpeg returned empty PCM"
+        audio = (audio_i16.astype(np.float32) / 32768.0)
+        return audio, target_sr, None
+    except subprocess.CalledProcessError as e:
+        return None, None, f"ffmpeg decode failed (returncode {e.returncode})"
+    except Exception as e:
+        return None, None, f"ffmpeg error: {e}"
+
+# ---------- load MP3 with robust fallback chain ----------
+errors = []
+audio, sr, err = _try_torchaudio(mp3_path)
+if err: errors.append(err)
+if audio is None:
+    audio, sr, err = _try_librosa(mp3_path)
+    if err: errors.append(err)
+if audio is None:
+    audio, sr, err = _try_ffmpeg(mp3_path)
+    if err: errors.append(err)
+
+if audio is None:
+    raise RuntimeError(
+        "Could not decode MP3 with any backend.\n"
+        + "\n".join(f"- {e}" for e in errors)
+        + "\nTips:\n"
+        + "• If torchaudio failed, it may lack MP3 support; try installing a build with mp3 (lame).\n"
+        + "• If librosa failed due to audioread/ffprobe, ensure ffmpeg is installed and reachable from this Python.\n"
+        + "• For ffmpeg, set an explicit path inside Python:\n"
+        + "    os.environ['FFMPEG_BIN'] = '/usr/local/bin/ffmpeg'   # or r'C:\\ffmpeg\\bin\\ffmpeg.exe'\n"
+    )
+
+# ---------- run your ASR pipeline ----------
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,
+    stride_length_s=(4, 2),
+)
+
+result = pipe({"array": audio, "sampling_rate": sr})
+print(result["text"])
+
+
+
+
+
+
+
+
+
+
 import os
 os.environ["PATH"] = "/usr/local/bin:" + os.environ["PATH"]
 
