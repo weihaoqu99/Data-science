@@ -1,3 +1,11 @@
+import librosa, audioread, subprocess, sys
+print("librosa:", librosa.__version__, "at", librosa.__file__)
+print("ffmpeg:", subprocess.check_output(["ffmpeg","-version"]).decode().splitlines()[0])
+
+
+
+
+
 import librosa
 from transformers import pipeline
 
