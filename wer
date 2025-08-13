@@ -1,3 +1,11 @@
+# 1) Make sure the 'audio' column never decodes
+from datasets import Audio
+raw_datasets = raw_datasets.cast_column("audio", Audio(decode=False))
+
+print(raw_datasets["train"].features)  # should show Audio(..., decode=False)
+# Access will now return a dict with a 'path' key; no decoding happens.
+
+
 from pathlib import Path
 import shutil
 
