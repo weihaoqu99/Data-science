@@ -1,3 +1,20 @@
+import audioread
+import numpy as np
+
+def read_mp3(filename):
+    with audioread.audio_open(filename) as f:
+        sr = f.samplerate
+        channels = f.channels
+        audio_data = b''.join([buf for buf in f])
+        audio_np = np.frombuffer(audio_data, dtype=np.int16)
+        audio_np = audio_np.reshape(-1, channels)
+        return audio_np, sr
+
+waveform, sr = read_mp3("your_file.mp3")
+print(waveform.shape, sr)
+
+
+
 from pydub import AudioSegment
 import io
 import torchaudio
