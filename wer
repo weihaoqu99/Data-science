@@ -1,3 +1,43 @@
+# --- deps
+import torch
+import librosa
+from transformers import pipeline
+
+# --- your existing model/processor (keep what you already have)
+# model = <your loaded model>
+# processor = <your loaded processor>  # with .tokenizer and .feature_extractor
+
+# pick the model's expected sampling rate if available, else default to 16k
+target_sr = getattr(getattr(processor, "feature_extractor", None), "sampling_rate", 16000)
+
+# --- load mp3 WITHOUT soundfile
+mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"
+audio, sr = librosa.load(mp3_path, sr=target_sr, mono=True)  # resamples to target_sr
+
+# --- build ASR pipeline with your model
+pipe = pipeline(
+    task="automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    torch_dtype=torch.float16,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,        # handles long audio
+    stride_length_s=(4, 2),   # cross-chunk context
+)
+
+# --- run & print transcription
+out = pipe({"array": audio, "sampling_rate": target_sr})
+print(out["text"])
+
+
+
+
+
+
+
+
+
 #
 
 import librosa
