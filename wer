@@ -1,3 +1,75 @@
+from transformers import TrainerCallback
+from tabulate import tabulate
+
+class LossWERCallback(TrainerCallback):
+    def __init__(self):
+        self.history = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if "loss" in logs:
+            self.history.append({
+                "Step": state.global_step,
+                "Training Loss": round(logs["loss"], 4),
+                "Validation Loss": None,
+                "WER": None
+            })
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if self.history and metrics:
+            self.history[-1]["Validation Loss"] = round(metrics.get("eval_loss", 0), 4)
+            self.history[-1]["WER"] = round(metrics.get("eval_wer", 0), 4)
+
+        # Print table each evaluation
+        print(tabulate(self.history, headers="keys"))
+
+# Attach callback
+trainer.add_callback(LossWERCallback())
+
+
+
+
+
+
+from transformers.trainer_callback import TrainerCallback
+
+class SolidMetricsTable(TrainerCallback):
+    def __init__(self):
+        self._printed_header = False
+
+    def _print_header_once(self):
+        if not self._printed_header:
+            hdr = f"{'Step':>8} | {'Train Loss':>12} | {'Val Loss':>10} | {'WER %':>7}"
+            print(hdr); print("-"*len(hdr))
+            self._printed_header = True
+
+    def _latest_train_loss(self, state, step):
+        last = None
+        for e in state.log_history:
+            if "loss" in e and int(e.get("step", step)) <= step:
+                last = float(e["loss"])
+        return last
+
+    def on_evaluate(self, args, state, control, metrics=None, **kw):
+        if not metrics: return
+        step = int(state.global_step)
+        train_loss = self._latest_train_loss(state, step)
+        val_loss   = float(metrics.get("eval_loss", metrics.get("loss", float("nan"))))
+        wer        = float(metrics.get("eval_wer", metrics.get("wer", float("nan"))))
+        self._print_header_once()
+        tl = "-" if train_loss is None else f"{train_loss:.4f}"
+        vl = "-" if val_loss != val_loss else f"{val_loss:.4f}"   # NaN check
+        wr = "-" if wer      != wer      else f"{wer:.2f}"
+        print(f"{step:8d} | {tl:>12} | {vl:>10} | {wr:>7}")
+
+trainer.add_callback(SolidMetricsTable())
+trainer.train()
+
+
+
+
+
+
+
 # --- Live table of Step | Train Loss | Val Loss | WER during trainer.train() ---
 
 from transformers.trainer_callback import TrainerCallback
