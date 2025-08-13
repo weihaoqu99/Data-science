@@ -1,3 +1,7 @@
+import os
+os.environ["PATH"] = "/usr/local/bin:" + os.environ["PATH"]
+
+
 import os, sys, shutil, subprocess
 import numpy as np
 import torch
