@@ -1,3 +1,45 @@
+# --- pure-Python word error rate (no dependencies) ---
+def _levenshtein(a, b):
+    # a, b: lists of tokens
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            prev, dp[j] = dp[j], min(
+                dp[j] + 1,            # deletion
+                dp[j-1] + 1,          # insertion
+                prev + (a[i-1] != b[j-1])  # substitution
+            )
+    return dp[n]
+
+def compute_metrics(pred):
+    # handle HF returning tuple for logits
+    preds = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+    labels = pred.label_ids
+
+    # replace -100 with pad so we can decode labels
+    pad_id = processor.tokenizer.pad_token_id
+    labels = labels.copy()
+    labels[labels == -100] = pad_id
+
+    pred_str  = processor.tokenizer.batch_decode(preds,  skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    # compute corpus WER
+    total_err, total_words = 0, 0
+    for ref, hyp in zip(label_str, pred_str):
+        ref_words = ref.strip().split()
+        hyp_words = hyp.strip().split()
+        total_err  += _levenshtein(ref_words, hyp_words)
+        total_words += max(1, len(ref_words))
+    wer = 100.0 * total_err / total_words
+    return {"wer": wer}
+
+
+
+
+
 # 1) Make sure the 'audio' column never decodes
 from datasets import Audio
 raw_datasets = raw_datasets.cast_column("audio", Audio(decode=False))
