@@ -1,3 +1,21 @@
+from pydub import AudioSegment
+import io
+import torchaudio
+
+# Load MP3 into memory and convert to WAV
+mp3_path = "/appdata/cortex/dev1/03-shell_carp_on_it_if_you_let_her.mp3"
+audio = AudioSegment.from_mp3(mp3_path)
+
+# Export to an in-memory buffer as WAV
+buf = io.BytesIO()
+audio.export(buf, format="wav")
+buf.seek(0)
+
+# Now load the WAV buffer with torchaudio
+waveform, sr = torchaudio.load(buf)
+print(waveform.shape, sr)
+
+
 import torchaudio
 
 # Set backend to sox_io (usually has MP3 support if torchaudio is installed correctly)
