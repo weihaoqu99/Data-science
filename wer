@@ -1,3 +1,180 @@
+# ==== SETTINGS (edit these) ===============================================
+SRC_DIR     = "/appdata/cortex/dev1/OrigAudio"   # where your MP3 files live
+WHISPER_DIR = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"  # or any HF id
+SEED        = 91
+# ==========================================================================
+
+import os, glob, re, subprocess, numpy as np, random
+from pathlib import Path
+from datasets import Dataset, DatasetDict
+from transformers import WhisperProcessor, WhisperForConditionalGeneration
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+import torch
+
+# ---------- 1) collect files + lightweight transcripts ----------
+files = sorted(set(glob.glob(f"{SRC_DIR}/**/*.mp3", recursive=True) +
+                   glob.glob(f"{SRC_DIR}/**/*.MP3", recursive=True)))
+if not files:
+    raise RuntimeError(f"No MP3 files found under {SRC_DIR}")
+
+def fn_to_text(p: str) -> str:
+    b = os.path.basename(p)
+    if b.lower().endswith(".mp3"): b = b[:-4]
+    # strip a leading "NNN-" if present
+    i = b.find("-")
+    s = b[i+1:] if i != -1 else b
+    s = (s.replace("_"," ").replace("."," ").strip()
+         .replace("dont","don't").replace("shell","she'll"))
+    s = s[0:1].upper() + s[1:] if s else s
+    s = s.replace(" i ", " I ")
+    return s
+
+transcripts = [fn_to_text(p) for p in files]
+raw = Dataset.from_dict({"audio_path": files, "sentence": transcripts}).with_format("python")
+
+# ---------- 2) split 80/20 ----------
+raw_datasets = raw.train_test_split(test_size=0.20, seed=SEED)
+print(raw_datasets)
+
+# ---------- 3) tiny audio loader (NO librosa/soundfile) ----------
+def load_audio_ffmpeg(path: str, target_sr: int = 16000):
+    """
+    Decodes with the ffmpeg CLI (no Python libs). Make sure 'ffmpeg' is on PATH.
+    """
+    cmd = ["ffmpeg","-v","error","-i",path,"-f","f32le","-ac","1","-ar",str(target_sr),"pipe:1"]
+    out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    y = np.frombuffer(out.stdout, dtype=np.float32)
+    return y, target_sr
+
+# ---------- 4) processor + model ----------
+processor = WhisperProcessor.from_pretrained(WHISPER_DIR, language="English", task="transcribe")
+model = WhisperForConditionalGeneration.from_pretrained(WHISPER_DIR)
+model.config.forced_decoder_ids = None
+model.config.suppress_tokens = []
+model.config.use_cache = False  # better with gradient checkpointing
+model.config.language = "english"
+model.config.task = "transcribe"
+
+# ---------- 5) map: turn path -> input_features + labels ----------
+def prepare_example(batch):
+    y, _ = load_audio_ffmpeg(batch["audio_path"], target_sr=16000)
+    batch["input_features"] = processor.feature_extractor(y, sampling_rate=16000).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+# keep single process to avoid re-importing audio stack
+vectorized = raw_datasets.map(
+    prepare_example,
+    remove_columns=raw_datasets["train"].column_names,  # ['audio_path','sentence']
+    num_proc=1,
+    desc="Preparing dataset",
+)
+
+# ---------- 6) simple data collator ----------
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+    decoder_start_token_id: int
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        label_features = [{"input_ids": f["labels"]} for f in features]
+
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        # drop BOS if your tokenizer adds it; Whisper usually adds BOS later in generate()
+        if labels.shape[1] > 0 and (labels[:, 0] == self.decoder_start_token_id).all().item():
+            labels = labels[:, 1:]
+        batch["labels"] = labels
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+    processor=processor,
+    decoder_start_token_id=model.config.decoder_start_token_id
+)
+
+# ---------- 7) pure-Python WER (no 'evaluate') ----------
+def _levenshtein(a, b):
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    for i in range(1, m + 1):
+        prev, dp[0] = dp[0], i
+        for j in range(1, n + 1):
+            prev, dp[j] = dp[j], min(dp[j] + 1, dp[j-1] + 1, prev + (a[i-1] != b[j-1]))
+    return dp[n]
+
+def compute_metrics(pred):
+    preds = pred.predictions[0] if isinstance(pred.predictions, tuple) else pred.predictions
+    labels = pred.label_ids.copy()
+    pad_id = processor.tokenizer.pad_token_id
+    labels[labels == -100] = pad_id
+
+    hyp = processor.tokenizer.batch_decode(preds,  skip_special_tokens=True)
+    ref = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+    total_err, total_words = 0, 0
+    for r, h in zip(ref, hyp):
+        r_w, h_w = r.strip().split(), h.strip().split()
+        total_err  += _levenshtein(r_w, h_w)
+        total_words += max(1, len(r_w))
+    wer = 100.0 * total_err / total_words if total_words else 0.0
+    return {"wer": wer}
+
+# ---------- 8) training args (ensure eval runs & prints) ----------
+args = Seq2SeqTrainingArguments(
+    output_dir="./asr_out",
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    gradient_accumulation_steps=8,
+    learning_rate=1e-5,
+    max_steps=1000,                    # or set num_train_epochs=3
+    fp16=torch.cuda.is_available(),
+    evaluation_strategy="steps",       # <-- will evaluate during training
+    eval_steps=50,
+    logging_strategy="steps",
+    logging_steps=25,
+    predict_with_generate=True,        # needed for decoding
+    generation_max_length=225,
+    remove_unused_columns=False,
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    load_best_model_at_end=True,
+    report_to=[],                      # no wandb/tensorboard needed
+    seed=SEED,
+)
+
+# ---------- 9) trainer + print-eval callback ----------
+from transformers.trainer_callback import TrainerCallback
+class PrintEvalCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics:
+            nice = {k: round(float(v), 4) for k, v in metrics.items() if isinstance(v, (int, float))}
+            print(f"\n[Eval @ step {state.global_step}] {nice}")
+
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=args,
+    train_dataset=vectorized["train"],
+    eval_dataset=vectorized["test"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor,
+)
+trainer.add_callback(PrintEvalCallback())
+
+# ---------- 10) train + final evaluate ----------
+print("train size:", len(vectorized["train"]), " test size:", len(vectorized["test"]))
+trainer.train()
+final_metrics = trainer.evaluate()
+print("\nFinal evaluation:", {k: round(float(v), 4) for k, v in final_metrics.items()})
+
+
+
+
 from transformers.trainer_callback import TrainerCallback
 
 class PrintEvalCallback(TrainerCallback):
