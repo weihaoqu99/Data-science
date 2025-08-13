@@ -1,3 +1,44 @@
+from transformers import TrainerCallback
+from tabulate import tabulate
+
+class LossWERCallback(TrainerCallback):
+    def __init__(self):
+        self.history = []
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if logs is None:
+            return
+        # Capture training loss if available
+        if "loss" in logs:
+            self.history.append({
+                "Step": state.global_step,
+                "Training Loss": round(logs["loss"], 4),
+                "Validation Loss": None,
+                "WER": None
+            })
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        if metrics is None:
+            return
+        # Update last record with eval metrics
+        if self.history:
+            self.history[-1]["Validation Loss"] = round(metrics.get("eval_loss", 0), 4)
+            self.history[-1]["WER"] = round(metrics.get("eval_wer", 0), 4)
+        
+        # Print table
+        print(tabulate(self.history, headers="keys"))
+
+# Attach the callback to your trainer
+trainer.add_callback(LossWERCallback())
+
+# Train
+trainer.train()
+
+
+
+
+
+
 # ==== SETTINGS (edit these) ===============================================
 SRC_DIR     = "/appdata/cortex/dev1/OrigAudio"   # where your MP3 files live
 WHISPER_DIR = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"  # or any HF id
