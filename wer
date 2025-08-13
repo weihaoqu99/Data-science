@@ -1,3 +1,5 @@
+import shutil; print(shutil.which("ffmpeg"))
+
 # ===================== EDIT ME =====================
 mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"  # your MP3
 # Your OWN already-loaded model & processor (keep your existing objects)
