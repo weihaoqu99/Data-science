@@ -1,3 +1,96 @@
+import os, sys, shutil, subprocess
+import numpy as np
+import torch
+from transformers import pipeline
+
+# ========= 1) Point this to your MP3 =========
+mp3_path = "/appdata/cortex/devl/zknze7ne/whisper_training/sample_for_synthetic.mp3"
+
+# ========= 2) Your loaded model & processor =========
+# model = ...
+# processor = ...
+target_sr = getattr(getattr(processor, "feature_extractor", None), "sampling_rate", 16000)
+
+# ========= 3) Robust ffmpeg discovery =========
+def find_ffmpeg():
+    # A) Respect explicit env override if you want to hard-set it:
+    #    os.environ["FFMPEG_BIN"] = r"C:\ffmpeg\bin\ffmpeg.exe"
+    if "FFMPEG_BIN" in os.environ and os.path.isfile(os.environ["FFMPEG_BIN"]):
+        return os.environ["FFMPEG_BIN"]
+
+    # B) Try PATH first
+    p = shutil.which("ffmpeg")
+    if p: 
+        return p
+
+    # C) Probe common locations for Linux/Mac/Conda/Windows
+    candidates = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",              # Apple Silicon (brew)
+        os.path.expanduser("~/.local/bin/ffmpeg"),
+        os.path.join(sys.prefix, "bin", "ffmpeg"),            # conda/env/bin/ffmpeg
+        os.path.join(sys.prefix, "Library", "bin", "ffmpeg"), # conda on Windows
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+
+    # D) Last attempt: extend PATH if ffmpeg installed but not visible
+    extra_paths = [
+        "/usr/local/bin", "/usr/bin", "/opt/homebrew/bin",
+        os.path.join(sys.prefix, "bin"),
+        os.path.join(sys.prefix, "Library", "bin"),
+        r"C:\ffmpeg\bin", r"C:\Program Files\ffmpeg\bin",
+    ]
+    os.environ["PATH"] = os.pathsep.join(extra_paths + [os.environ.get("PATH", "")])
+    p = shutil.which("ffmpeg")
+    if p:
+        return p
+
+    raise RuntimeError(
+        "ffmpeg not found from Python. If it is installed, either:\n"
+        "  1) Set os.environ['FFMPEG_BIN'] to the full path of ffmpeg, or\n"
+        "  2) Add its folder to PATH inside this notebook and re-run."
+    )
+
+ffmpeg_cmd = find_ffmpeg()
+
+# ========= 4) Decode MP3 → float32 PCM with ffmpeg (no soundfile/librosa/torchaudio) =========
+cmd = [
+    ffmpeg_cmd, "-i", mp3_path,
+    "-f", "s16le", "-acodec", "pcm_s16le",
+    "-ac", "1", "-ar", str(target_sr),
+    "-hide_banner", "-loglevel", "error",
+    "pipe:1"
+]
+proc = subprocess.run(cmd, check=True, stdout=subprocess.PIPE)
+
+audio_int16 = np.frombuffer(proc.stdout, dtype=np.int16)
+audio = (audio_int16.astype(np.float32) / 32768.0)
+
+# ========= 5) ASR pipeline with YOUR model =========
+pipe = pipeline(
+    "automatic-speech-recognition",
+    model=model,
+    tokenizer=processor.tokenizer,
+    feature_extractor=processor.feature_extractor,
+    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+    device=0 if torch.cuda.is_available() else -1,
+    chunk_length_s=30,
+    stride_length_s=(4, 2),
+)
+
+result = pipe({"array": audio, "sampling_rate": target_sr})
+print(result["text"])
+
+
+
+
+
+
 import subprocess, shutil, sys
 import numpy as np
 import torch
