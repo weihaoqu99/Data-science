@@ -1,3 +1,142 @@
+# =========================
+# ASR TESTING / INFERENCE
+# =========================
+# Requirements: torch, transformers, numpy, pandas, miniaudio
+# Assumes you still have `raw_datasets` from training with columns:
+#   raw_datasets["test"][i] -> {"audio_path": <path>, "sentence": <reference>}
+
+import os
+import torch
+import numpy as np
+import miniaudio
+import pandas as pd
+from typing import List
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+# -----------------
+# Paths & devices
+# -----------------
+save_dir = "/appdata/cortex/dev1/shob/ASR model/asr finetuning/distil_loc_Basemodel"  # <- your saved model
+fallback_proc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"                   # if processor not saved
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# -----------------
+# Load model & processor
+# -----------------
+model = WhisperForConditionalGeneration.from_pretrained(save_dir).to(device)
+try:
+    processor = WhisperProcessor.from_pretrained(save_dir, language="English", task="transcribe")
+except Exception:
+    processor = WhisperProcessor.from_pretrained(fallback_proc, language="English", task="transcribe")
+
+# Keep config consistent with training
+model.config.language = "english"
+model.config.task = "transcribe"
+# Avoid generation conflict:
+if hasattr(model, "generation_config") and model.generation_config is not None:
+    model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
+
+model.eval()
+
+# -----------------
+# Audio loader (no librosa/ffmpeg needed)
+# -----------------
+def load_mp3(path: str, target_sr: int = 16000):
+    sb = miniaudio.decode_file(path)
+    sr_native = getattr(sb, "sample_rate", 16000)
+    ch = getattr(sb, "channels", 1)
+    y = np.asarray(sb.samples, dtype=np.float32)
+    if ch > 1:
+        y = y.reshape(-1, ch).mean(axis=1)  # stereo -> mono
+    if sr_native != target_sr:
+        n_new = int(len(y) * target_sr / sr_native)
+        y = np.interp(
+            np.linspace(0, len(y), n_new, endpoint=False),
+            np.arange(len(y), dtype=np.float32),
+            y.astype(np.float32)
+        ).astype(np.float32)
+    return y, target_sr
+
+# -----------------
+# WER helpers (your Levenshtein)
+# -----------------
+def levenshtein(a: List[str], b: List[str]) -> int:
+    m, n = len(a), len(b)
+    dp = list(range(n + 1))
+    prev = [0] * (n + 1)
+    for i in range(1, m + 1):
+        prev, dp = dp, [i] + [0] * n
+        for j in range(1, n + 1):
+            dp[j] = min(prev[j] + 1, dp[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+    return dp[n]
+
+def sample_wer(ref: str, hyp: str) -> float:
+    ref_tok = ref.strip().split()
+    hyp_tok = hyp.strip().split()
+    denom = max(1, len(ref_tok))
+    return 100.0 * levenshtein(ref_tok, hyp_tok) / denom
+
+# -----------------
+# Build decoder prompt for Whisper and run inference
+# -----------------
+prompt_ids = processor.get_decoder_prompt_ids(language="english", task="transcribe")
+decoder_input_ids = torch.tensor([prompt_ids], device=device)
+
+# Pull test split from your prepared dataset
+test_paths = [row["audio_path"] for row in raw_datasets["test"]]
+test_refs  = [row["sentence"]   for row in raw_datasets["test"]]
+
+preds = []
+per_sample_wers = []
+
+for pth, ref in zip(test_paths, test_refs):
+    wav, sr = load_mp3(pth, target_sr=16000)
+    feats = processor.feature_extractor(wav, sampling_rate=sr).input_features
+    feats = torch.tensor(feats, dtype=torch.float32, device=device)
+
+    with torch.no_grad():
+        gen_ids = model.generate(
+            inputs=feats,
+            decoder_input_ids=decoder_input_ids,  # <-- fixes forced_decoder_ids error
+            max_length=225
+        )
+
+    hyp = processor.tokenizer.batch_decode(gen_ids, skip_special_tokens=True)[0]
+    preds.append(hyp)
+    per_sample_wers.append(sample_wer(ref, hyp))
+
+# -----------------
+# Results: print first 5, overall WER, save CSV
+# -----------------
+print("\n=== First 5 test predictions ===")
+for i in range(min(5, len(preds))):
+    print(f"\n[{i}] file: {os.path.basename(test_paths[i])}")
+    print("REF:", test_refs[i])
+    print("HYP:", preds[i])
+    print("WER:%0.2f" % per_sample_wers[i])
+
+overall_wer = sum(per_sample_wers) / max(1, len(per_sample_wers))
+print(f"\n=== Overall Test WER: {overall_wer:.2f}% ===")
+
+df = pd.DataFrame({
+    "audio_path": test_paths,
+    "reference":  test_refs,
+    "prediction": preds,
+    "WER_%":      per_sample_wers
+})
+out_csv = "test_predictions_from_saved_model.csv"
+df.to_csv(out_csv, index=False)
+print(f"Saved full test results to: {out_csv}")
+
+
+
+
+
+
+
+
+
 # ===== Inference on test data with the SAVED model =====
 
 import os
