@@ -1,3 +1,91 @@
+1) Base model & libs
+	•	Chose Distil-Whisper base: distil-whisper/distil-large-v2.
+	•	Used WhisperForConditionalGeneration + WhisperProcessor from 🤗 Transformers.
+	•	Avoided librosa/ffmpeg; used miniaudio to load MP3s.
+
+2) Build dataset from MP3 filenames
+	•	Collected MP3s (e.g., /appdata/cortex/dev1/origAudio/*.mp3).
+	•	Derived transcripts from filenames with your retrieve_transcript() cleanup (underscores → spaces, fixes like dont→don't, capitalization, etc.).
+	•	Created a HuggingFace Dataset with:
+	•	audio_path (full file path)
+	•	sentence (reference text)
+	•	Split into train/test (e.g., 85/15).
+
+3) Feature/label preparation (no librosa)
+	•	Wrote load_mp3() using miniaudio:
+	•	Decode → mono → resample to 16kHz.
+	•	For each example:
+	•	processor.feature_extractor(...) → input_features (80×T log-Mels).
+	•	processor.tokenizer(...) → labels (input IDs).
+
+4) Data collator
+	•	Batched input_features and padded labels.
+	•	Replaced label padding with -100 (so loss ignores it).
+	•	Stripped leading decoder_start_token_id when present.
+
+5) Model setup
+	•	Loaded base (or local) Distil-Whisper with:
+	•	WhisperForConditionalGeneration.from_pretrained(...)
+	•	WhisperProcessor.from_pretrained(..., language="English", task="transcribe")
+	•	Set:
+	•	model.config.language = "english"
+	•	model.config.task = "transcribe"
+
+6) Training
+	•	Used Seq2SeqTrainer with typical ASR settings:
+	•	per_device_train_batch_size, gradient_accumulation_steps, learning_rate=1e-5,
+	•	max_steps (e.g., 1000), fp16 when GPU available,
+	•	predict_with_generate=True, generation_max_length=225,
+	•	evaluation_strategy="steps" to compute WER during training.
+	•	Metrics:
+	•	Implemented WER via Levenshtein distance on word tokens.
+	•	Trained successfully.
+	•	Saved both model and processor to your save dir:
+	•	/appdata/cortex/dev1/shob/ASR model/asr finetuning/distil_loc_Basemodel
+
+7) Inference/testing on ALL test MP3s
+	•	Reloaded the saved model and processor.
+	•	Fixed generation config conflicts by clearing:
+	•	model.generation_config.forced_decoder_ids = None
+	•	model.generation_config.suppress_tokens = [] (optional)
+	•	Built Whisper prompt once:
+	•	prompt_ids = processor.get_decoder_prompt_ids(language="english", task="transcribe")
+	•	Important fix (error you hit):
+	•	Created a robust make_batch_prompt(...) to ensure decoder_input_ids has shape (B, P) for any batch size, avoiding:
+	•	“size mismatch” and
+	•	“repeat dims smaller than tensor dims”.
+
+8) Batched generation
+	•	Processed test files in batches (e.g., BATCH_SIZE=8):
+	•	MP3 → features → stack to (B, 80, T)
+	•	decoder_input_ids = (B, P) from prompt_ids
+	•	model.generate(inputs=feats, decoder_input_ids=dec_in, max_length=225)
+	•	Decoded tokens → predicted text (HYP).
+
+9) Scoring + CSV
+	•	Computed per-sample WER with your Levenshtein.
+	•	Computed Overall Test WER (mean of per-sample WERs).
+	•	Wrote CSV with columns:
+	•	audio_path, reference, prediction, WER_%
+	•	Previewed first 5 items.
+	•	Final small fix: used df["WER_%"][i] (bracket indexing), not df.WER_%[i].
+
+10) What you see as results
+	•	Console output:
+	•	Overall Test WER: XX.XX% | Samples: N
+	•	First 5 lines with REF:, HYP:, and WER:
+	•	File output:
+	•	test_predictions_from_saved_model.csv (or test_predictions.csv) saved in your working dir (or SAVE_DIR
+
+
+
+
+
+
+
+
+
+
 # quick peek (fixed)
 for i in range(min(5, len(df))):
     print(f"\n[{i}] {os.path.basename(df['audio_path'][i])}")
