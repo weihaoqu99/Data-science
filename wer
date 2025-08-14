@@ -1,3 +1,13 @@
+# quick peek (fixed)
+for i in range(min(5, len(df))):
+    print(f"\n[{i}] {os.path.basename(df['audio_path'][i])}")
+    print("REF:", df["reference"][i])
+    print("HYP:", df["prediction"][i])
+    print("WER: %.2f%%" % df["WER_%"][i])
+
+
+
+
 # ==== Whisper ASR: Test ALL MP3s + CSV (robust prompt shape) ====
 import os, torch, numpy as np, pandas as pd, miniaudio
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
