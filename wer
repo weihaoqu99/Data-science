@@ -1,3 +1,117 @@
+# ==== Whisper ASR: Test ALL MP3s + CSV (robust prompt shape) ====
+import os, torch, numpy as np, pandas as pd, miniaudio
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+# --- config ---
+SAVE_DIR   = "/appdata/cortex/dev1/shob/ASR model/asr finetuning/distil_loc_Basemodel"
+FALLBACK   = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"  # only if processor wasn't saved
+BATCH_SIZE = 8
+MAX_LEN    = 225
+CSV_OUT    = "test_predictions_from_saved_model.csv"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- load model/processor ---
+model = WhisperForConditionalGeneration.from_pretrained(SAVE_DIR).to(device).eval()
+try:
+    processor = WhisperProcessor.from_pretrained(SAVE_DIR, language="English", task="transcribe")
+except Exception:
+    processor = WhisperProcessor.from_pretrained(FALLBACK, language="English", task="transcribe")
+
+# avoid generate() conflicts
+if getattr(model, "generation_config", None):
+    model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
+
+# --- helpers ---
+def load_mp3(path, target_sr=16000):
+    sb = miniaudio.decode_file(path)
+    sr, ch = getattr(sb, "sample_rate", 16000), getattr(sb, "channels", 1)
+    y = np.asarray(sb.samples, dtype=np.float32)
+    if ch > 1:
+        y = y.reshape(-1, ch).mean(axis=1)
+    if sr != target_sr:
+        n = int(len(y) * target_sr / sr)
+        y = np.interp(np.linspace(0, len(y), n, endpoint=False),
+                      np.arange(len(y), dtype=np.float32), y.astype(np.float32)).astype(np.float32)
+    return y, target_sr
+
+def levenshtein(a, b):
+    m, n = len(a), len(b); dp = list(range(n+1)); prev = [0]*(n+1)
+    for i in range(1, m+1):
+        prev, dp = dp, [i]+[0]*n
+        for j in range(1, n+1):
+            dp[j] = min(prev[j]+1, dp[j-1]+1, prev[j-1] + (a[i-1] != b[j-1]))
+    return dp[n]
+
+def wer_pct(ref, hyp):
+    r, h = ref.split(), hyp.split()
+    if len(r) == 0:  # avoid division by zero
+        return 0.0 if len(h) == 0 else 100.0
+    raw_wer = 100.0 * levenshtein(r, h) / len(r)
+    if raw_wer > 100.0:
+        print(f"[WARN] WER > 100% detected ({raw_wer:.2f}%). Clamping to 100%.")
+        raw_wer = 100.0
+    return raw_wer
+
+def make_batch_prompt(prompt_ids, batch_size, device):
+    """Return decoder_input_ids with shape (B, P) regardless of incoming shape."""
+    t = torch.as_tensor(prompt_ids, device=device)
+    if t.ndim == 1:        # [P] -> [1,P]
+        t = t.unsqueeze(0)
+    elif t.ndim >= 3:      # rare: flatten extras -> [1,P]
+        t = t.view(1, -1)
+    t = t[:1]
+    return t.repeat(batch_size, 1)  # (B, P)
+
+# --- test set from your prepared split ---
+test_paths = [row["audio_path"] for row in raw_datasets["test"]]
+test_refs  = [row["sentence"]   for row in raw_datasets["test"]]
+
+prompt_ids = processor.get_decoder_prompt_ids(language="english", task="transcribe")
+
+preds, wers = [], []
+for s in range(0, len(test_paths), BATCH_SIZE):
+    e = min(s + BATCH_SIZE, len(test_paths))
+    feats_list = []
+    for p in test_paths[s:e]:
+        wav, sr = load_mp3(p, 16000)
+        feats_np = processor.feature_extractor(wav, sampling_rate=sr).input_features  # (1,80,T)
+        feats_list.append(torch.as_tensor(feats_np, dtype=torch.float32))
+    feats = torch.cat(feats_list, dim=0).to(device)                 # (B,80,T)
+    dec_in = make_batch_prompt(prompt_ids, feats.size(0), device)   # (B,P)
+
+    with torch.no_grad():
+        gen = model.generate(inputs=feats, decoder_input_ids=dec_in, max_length=MAX_LEN)
+    batch_txt = processor.tokenizer.batch_decode(gen, skip_special_tokens=True)
+    preds.extend(batch_txt)
+
+# metrics + CSV
+wers = [wer_pct(r, h) for r, h in zip(test_refs, preds)]
+overall_wer = sum(wers) / max(1, len(wers))
+print(f"Overall Test WER: {overall_wer:.2f}%  |  Samples: {len(preds)}")
+
+df = pd.DataFrame({"audio_path": test_paths, "reference": test_refs, "prediction": preds, "WER_%": wers})
+df.to_csv(CSV_OUT, index=False)
+print(f"Saved: {CSV_OUT}")
+
+# quick peek (with safeguard applied)
+for i in range(min(5, len(df))):
+    print(f"\n[{i}] {os.path.basename(df['audio_path'][i])}")
+    print("REF:", df["reference"][i])
+    print("HYP:", df["prediction"][i])
+    print("WER: %.2f%%" % df["WER_%"][i])
+
+
+
+
+
+
+
+
+
+
+
 import torch, numpy as np, pandas as pd, miniaudio
 from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
