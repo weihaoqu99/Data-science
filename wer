@@ -1,3 +1,64 @@
+trainer.save_model(ADAPTER_DIR)
+print(f"[OK] LoRA adapter saved to: {ADAPTER_DIR}")
+# ----------------------------------------------------
+
+# ======================== TESTING ========================
+# Your BASE + ADAPTER snippet (unchanged in spirit)
+from peft import PeftModel
+
+ADAPTER = ADAPTER_DIR
+device  = "cuda" if torch.cuda.is_available() else "cpu"
+
+base_model = WhisperForConditionalGeneration.from_pretrained(BASE).to(device).eval()
+model = PeftModel.from_pretrained(base_model, ADAPTER).to(device).eval()
+processor = WhisperProcessor.from_pretrained(BASE, language="English", task="transcribe")
+
+# Avoid forced decoder IDs when generating
+if getattr(model, "generation_config", None):
+    model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
+
+# Test set from the same split
+test_paths = [row["audio_path"] for row in raw_datasets["test"]]
+test_refs  = [row["sentence"] for row in raw_datasets["test"]]
+prompt_ids = processor.get_decoder_prompt_ids(language="english", task="transcribe")
+
+preds, wers = [], []
+for s in range(0, len(test_paths), BATCH_TEST):
+    e = min(s + BATCH_TEST, len(test_paths))
+    feats_batch = []
+    for p in test_paths[s:e]:
+        wav, sr = load_mp3(p, SAMPLE_RATE)
+        feats = processor.feature_extractor(wav, sampling_rate=sr).input_features
+        feats_batch.append(torch.as_tensor(feats, dtype=torch.float32))
+    feats = torch.cat(feats_batch, dim=0).to(device)
+    dec_in = torch.as_tensor(prompt_ids, device=device).repeat(feats.size(0), 1)
+    with torch.no_grad():
+        gen = model.generate(inputs=feats, decoder_input_ids=dec_in, max_length=MAX_LEN)
+        txt = processor.tokenizer.batch_decode(gen, skip_special_tokens=True)
+    preds.extend(txt)
+    wers.extend([wer_pct(r, h) for r, h in zip(test_refs[s:e], txt)])
+
+overall = float(np.mean(wers)) if wers else math.nan
+print(f"Overall Test WER: {overall:.2f}% | Samples: {len(test_paths)}")
+
+df = pd.DataFrame({"audio_path": test_paths, "reference": test_refs, "prediction": preds, "WER%": wers})
+df.to_csv(CSV_OUT, index=False)
+print(f"[OK] Saved CSV: {CSV_OUT}")
+
+# quick peek
+for i in range(min(5, len(df))):
+    print("\n", os.path.basename(df['audio_path'][i]))
+    print("REF:", df['reference'][i])
+    print("HYP:", df['prediction'][i])
+    print("WER: %.2f%%" % df['WER%'][i])
+# ====================== END TESTING ===
+
+
+
+
+
+
 # pip install -q peft
 from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 
