@@ -1,3 +1,76 @@
+# pip install -q peft
+from peft import LoraConfig, get_peft_model, PeftModel, TaskType
+
+# ----- LoRA -----
+# Whisper uses names like q_proj/k_proj/v_proj/out_proj in its attention layers
+lora_config = LoraConfig(
+    r=512,                      # rank
+    lora_alpha=128,             # scaling
+    lora_dropout=0.0,           # keep 0.0 unless you want regularization
+    bias="none",
+    task_type=TaskType.SEQ_2_SEQ_LM,
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"]  # attention projections
+    # If you also want FFN adapters, add: "fc1", "fc2"
+    ,
+    use_rslora=True             # RS-LoRA like in your screenshot
+)
+
+# enable grads on inputs for peft+gradient checkpointing combos
+model.enable_input_require_grads()
+
+# wrap base model with LoRA adapters
+model = get_peft_model(model, lora_config)
+
+# (optional) sanity check
+def print_trainable_parameters(m):
+    trainable, total = 0, 0
+    for _, p in m.named_parameters():
+        total += p.numel()
+        if p.requires_grad:
+            trainable += p.numel()
+    print(f"Trainable params: {trainable:,} | Total: {total:,} | %: {100*trainable/total:.2f}%")
+
+print_trainable_parameters(model)
+# ----------------
+
+
+trainer.save_model("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/distil_whisper_v2_finetuned_2_lora")
+
+
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from peft import PeftModel
+
+BASE = distil_loc  # same path you used for the base model (e.g., distil-large-v2 copy)
+ADAPTER = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/distil_whisper_v2_finetuned_2_lora"
+
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+base_model = WhisperForConditionalGeneration.from_pretrained(BASE).to(device).eval()
+model = PeftModel.from_pretrained(base_model, ADAPTER).to(device).eval()
+
+processor = WhisperProcessor.from_pretrained(BASE, language="English", task="transcribe")
+
+# Avoid forced decoder IDs when generating
+if getattr(model, "generation_config", None):
+    model.generation_config.forced_decoder_ids = None
+    model.generation_config.suppress_tokens = []
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 # ==== Whisper ASR: Test ALL MP3s + CSV (robust prompt shape) ====
 import os, torch, numpy as np, pandas as pd, miniaudio
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
