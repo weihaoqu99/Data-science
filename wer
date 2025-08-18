@@ -1,6 +1,49 @@
 import os
 import re
 
+# Output folder for test references
+TEST_REF_DIR = "./test_references_txt"
+os.makedirs(TEST_REF_DIR, exist_ok=True)
+
+# Work only with the test split from raw_datasets
+test_split = raw_datasets["test"]
+
+for row in test_split:
+    audio_path = row["audio_path"]
+    ref = row["sentence"]
+
+    base = os.path.splitext(os.path.basename(audio_path))[0]  
+    # e.g. "08-I'm not able to use my card right now"
+
+    # Split number + text part
+    match = re.match(r"(\d+)-(.*)", base)
+    if match:
+        num = match.group(1)          # "08"
+        text_part = match.group(2).strip()  # "I'm not able to use my card right now"
+    else:
+        num = "NA"
+        text_part = base
+
+    # Clean text: replace spaces with underscores
+    safe_text = text_part.replace(" ", "_")
+
+    # New filename: <sentence_with_underscores>_<num>.txt
+    new_name = f"{safe_text}_{num}.txt"
+    out_file = os.path.join(TEST_REF_DIR, new_name)
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(ref + "\n")
+
+print(f"✅ Wrote {len(test_split)} test reference files to {TEST_REF_DIR}")
+
+
+
+
+
+
+import os
+import re
+
 # Your test split
 test_split = raw_datasets["test"]
 
