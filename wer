@@ -1,3 +1,32 @@
+import os
+
+# Your test split
+test_split = raw_datasets["test"]
+
+# Folder to save reference text files
+REF_OUT_DIR = "./test_references_txt"
+os.makedirs(REF_OUT_DIR, exist_ok=True)
+
+for row in test_split:
+    audio_path = row["audio_path"]
+    ref = row["sentence"]
+
+    # take the base name of the audio file (without extension)
+    base = os.path.splitext(os.path.basename(audio_path))[0]  
+    # e.g. "ground_truth_08"
+
+    # use the same name for the .txt file
+    out_file = os.path.join(REF_OUT_DIR, base + ".txt")
+
+    with open(out_file, "w", encoding="utf-8") as f:
+        f.write(ref + "\n")
+
+print(f"[OK] Wrote {len(test_split)} reference text files to {REF_OUT_DIR}")
+
+
+
+
+
 import os, re
 
 # Your test split
