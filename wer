@@ -1,3 +1,36 @@
+import os, re
+
+TEST_REF_DIR = "./test_references_txt"
+os.makedirs(TEST_REF_DIR, exist_ok=True)
+
+for row in raw_datasets["test"]:
+    audio_path = row["audio_path"]
+    ref = row["sentence"]
+
+    # filename without extension
+    base = os.path.splitext(os.path.basename(audio_path))[0]
+
+    # extract number and text
+    m = re.match(r"(\d+)-(.*)", base)
+    if not m: 
+        continue
+    num, text = m.groups()
+
+    # clean text -> underscores
+    safe_text = text.strip().replace(" ", "_")
+
+    # final file name: sentence_num.txt
+    fname = f"{safe_text}_{num}.txt"
+
+    with open(os.path.join(TEST_REF_DIR, fname), "w", encoding="utf-8") as f:
+        f.write(ref + "\n")
+
+print(f"✅ Wrote {len(raw_datasets['test'])} clean reference files")
+
+
+
+
+
 import os
 import re
 
