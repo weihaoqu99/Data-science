@@ -1,32 +1,35 @@
-import os, re
+import os
+import re
 
+# Output folder for test references
 TEST_REF_DIR = "./test_references_txt"
 os.makedirs(TEST_REF_DIR, exist_ok=True)
 
-for row in raw_datasets["test"]:
+# Work only with the test split from raw_datasets
+test_split = raw_datasets["test"]
+
+for row in test_split:
     audio_path = row["audio_path"]
     ref = row["sentence"]
 
-    # filename without extension
-    base = os.path.splitext(os.path.basename(audio_path))[0]
+    base = os.path.splitext(os.path.basename(audio_path))[0]  
+    # e.g. "08-I'm not able to use my card right now"
 
-    # extract number and text
-    m = re.match(r"(\d+)-(.*)", base)
-    if not m: 
-        continue
-    num, text = m.groups()
+    # Extract the number from the start of the filename
+    match = re.match(r"(\d+)-", base)
+    if match:
+        num = match.group(1)   # "08"
+    else:
+        num = "NA"             # fallback if no number
 
-    # clean text -> underscores
-    safe_text = text.strip().replace(" ", "_")
+    # New filename: ground_truth_<num>.txt
+    new_name = f"ground_truth_{num}.txt"
+    out_file = os.path.join(TEST_REF_DIR, new_name)
 
-    # final file name: sentence_num.txt
-    fname = f"{safe_text}_{num}.txt"
-
-    with open(os.path.join(TEST_REF_DIR, fname), "w", encoding="utf-8") as f:
+    with open(out_file, "w", encoding="utf-8") as f:
         f.write(ref + "\n")
 
-print(f"✅ Wrote {len(raw_datasets['test'])} clean reference files")
-
+print(f"✅ Wrote {len(test_split)} ground truth files to {TEST_REF_DIR}")
 
 
 
