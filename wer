@@ -1,3 +1,31 @@
+import sys, platform, soundfile, ctypes.util, os
+
+print("Python:", sys.executable)
+print("soundfile version:", soundfile.__version__)
+print("soundfile module:", soundfile.__file__)
+print("find_library('sndfile'):", ctypes.util.find_library('sndfile'))
+
+# Optional: show common lib dirs
+print("LD_LIBRARY_PATH:", os.environ.get("LD_LIBRARY_PATH"))
+
+import subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-cache-dir", "soundfile==0.12.1"])
+
+import os
+os.environ["LD_LIBRARY_PATH"] = (os.environ.get("LD_LIBRARY_PATH","") + ":/usr/lib:/usr/lib/x86_64-linux-gnu").lstrip(":")
+# now import soundfile
+import soundfile as sf
+print(sf.__libsndfile_version__)
+
+import subprocess, sys
+subprocess.check_call(["conda", "install", "-y", "-c", "conda-forge", "libsndfile", "soundfile"])
+
+
+
+
+
+
 import os
 os.environ["LD_LIBRARY_PATH"] = (os.environ.get("LD_LIBRARY_PATH","") + ":/usr/lib:/usr/lib/x86_64-linux-gnu").lstrip(":")
 # now import soundfile
