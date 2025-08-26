@@ -1,3 +1,46 @@
+import sys, subprocess, site, os, shutil, importlib, glob
+
+# 1) Uninstall transformers (ignore errors if not installed)
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "transformers"], check=False)
+
+# 2) Hard-delete any leftover copies that can shadow a fresh install
+paths = set(site.getsitepackages() + [site.getusersitepackages()])
+for p in paths:
+    d = os.path.join(p, "transformers")
+    if os.path.isdir(d):
+        print("Removing:", d)
+        shutil.rmtree(d)
+    # also remove any zipped/egg dists
+    for z in glob.glob(os.path.join(p, "transformers*.dist-info")) + glob.glob(os.path.join(p, "transformers*.egg-info")):
+        print("Removing:", z)
+        shutil.rmtree(z)
+
+# 3) Install a self-consistent version (recent & compatible)
+#    4.45.x exports HybridCache/EncoderDecoderCache and matches trainer_seq2seq
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                       "transformers==4.45.2", "accelerate>=0.30.0", "sentencepiece", "huggingface_hub"])
+
+# 4) Verify the *same* package is imported, and required symbols exist
+importlib.invalidate_caches()
+import transformers
+from transformers import cache_utils
+print("Transformers:", transformers.__version__, "from", transformers.__file__)
+print("Has HybridCache? ", hasattr(cache_utils, "HybridCache"))
+print("Has EncoderDecoderCache? ", hasattr(cache_utils, "EncoderDecoderCache"))
+
+# 5) Final import test
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments, WhisperForConditionalGeneration, WhisperProcessor
+print("✅ Imports OK")
+
+
+
+
+
+
+
+
+
+
 import sys, subprocess, site, os, shutil, importlib
 
 # 1) Uninstall and remove any leftovers that can shadow the new install
