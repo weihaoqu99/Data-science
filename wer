@@ -1,3 +1,14 @@
+pip install transformers==4.44.2
+pip install accelerate==0.30.0 sentencepiece datasets
+
+import transformers
+print(transformers.__version__)
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+print("✅ All imports successful")
+
+
 import sys, subprocess, site, os, shutil, importlib, glob
 
 # 1) Uninstall transformers (ignore errors if not installed)
