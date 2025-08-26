@@ -1,3 +1,11 @@
+import sys, subprocess
+
+# Update pyopenssl and cryptography to latest
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pyopenssl", "cryptography"])
+
+
+
+
 import sys, subprocess, os, glob
 
 # 1) Get fresh wheels
