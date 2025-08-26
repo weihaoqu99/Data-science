@@ -1,3 +1,26 @@
+# --- hotfix: add clear_device_cache if accelerate is old ---
+try:
+    import accelerate.utils.memory as _acc_mem
+    if not hasattr(_acc_mem, "clear_device_cache"):
+        def clear_device_cache():
+            # minimal safe fallback
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                pass
+        _acc_mem.clear_device_cache = clear_device_cache
+        print("Patched accelerate.utils.memory.clear_device_cache()")
+except Exception as e:
+    print("Could not import accelerate:", e)
+
+
+
+
+
+
 # --- safe WER metric import (no local shadowing) ---
 import sys, importlib.util
 
