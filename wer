@@ -1,3 +1,25 @@
+import sys, subprocess, os, glob
+
+# 1) Get fresh wheels
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+
+# 2) Install a wheel that ships a libsndfile (package name: sndfile) + SoundFile itself
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir", "sndfile==0.2.1", "soundfile==0.12.1"])
+
+# 3) Point SoundFile at the bundled libsndfile
+import sndfile
+libdir = os.path.dirname(sndfile.__file__)
+cands = sorted(glob.glob(os.path.join(libdir, "libsndfile*.so*")))
+if not cands:
+    raise RuntimeError("Could not find bundled libsndfile in 'sndfile' package.")
+os.environ["SOUNDFILE_LIBRARY"] = cands[0]  # SoundFile reads this env var
+
+# 4) Verify
+import soundfile as sf
+print("libsndfile:", sf.__libsndfile_version__)
+
+
+
 import sys, platform, soundfile, ctypes.util, os
 
 print("Python:", sys.executable)
