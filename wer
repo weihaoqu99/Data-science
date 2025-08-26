@@ -1,3 +1,63 @@
+# --- safe WER metric import (no local shadowing) ---
+import sys, importlib.util
+
+# if a module named "wer" is already imported (e.g., local wer.py), drop it
+sys.modules.pop("wer", None)
+
+import evaluate
+try:
+    wer_metric = evaluate.load("wer")   # HF evaluate metric
+except Exception as e:
+    # Fallback: compute WER without evaluate (no extra installs)
+    from typing import List
+
+    def _edit_distance(ref_words: List[str], hyp_words: List[str]) -> int:
+        m, n = len(ref_words), len(hyp_words)
+        dp = [[0]*(n+1) for _ in range(m+1)]
+        for i in range(m+1): dp[i][0] = i
+        for j in range(n+1): dp[0][j] = j
+        for i in range(1, m+1):
+            for j in range(1, n+1):
+                cost = 0 if ref_words[i-1] == hyp_words[j-1] else 1
+                dp[i][j] = min(dp[i-1][j] + 1,      # deletion
+                               dp[i][j-1] + 1,      # insertion
+                               dp[i-1][j-1] + cost) # substitution
+        return dp[m][n]
+
+    class _SimpleWER:
+        def compute(self, predictions, references):
+            # corpus-level WER = sum(edit distance) / sum(#ref words)
+            err = 0
+            words = 0
+            for r, p in zip(references, predictions):
+                rw, pw = r.strip().split(), p.strip().split()
+                err += _edit_distance(rw, pw)
+                words += max(1, len(rw))
+            return err / words
+
+    wer_metric = _SimpleWER()
+
+def compute_metrics(pred):
+    pred_ids  = pred.predictions
+    label_ids = pred.label_ids
+
+    # replace -100 with pad token id so we can decode labels
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    # decode
+    pred_str  = processor.batch_decode(pred_ids,  skip_special_tokens=True)
+    label_str = processor.batch_decode(label_ids, skip_special_tokens=True)
+
+    # basic normalization
+    pred_str  = [s.strip() for s in pred_str]
+    label_str = [s.strip() for s in label_str]
+
+    wer = 100.0 * float(wer_metric.compute(predictions=pred_str, references=label_str))
+    return {"wer": wer}
+
+
+
+
 import sys, subprocess, site, os, shutil, importlib, glob
 
 # 1) Uninstall and purge any leftovers
