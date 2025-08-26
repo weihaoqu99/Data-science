@@ -1,4 +1,10 @@
 import os
+os.environ["LD_LIBRARY_PATH"] = (os.environ.get("LD_LIBRARY_PATH","") + ":/usr/lib:/usr/lib/x86_64-linux-gnu").lstrip(":")
+# now import soundfile
+import soundfile as sf
+print(sf.__libsndfile_version__)
+
+import os
 import re
 
 # Output folder for test references
