@@ -1,3 +1,35 @@
+import sys, subprocess, site, os, shutil, importlib
+
+# 1) Uninstall and remove any leftovers that can shadow the new install
+subprocess.run([sys.executable, "-m", "pip", "uninstall", "-y", "transformers"], check=False)
+for p in set(site.getsitepackages() + [site.getusersitepackages()]):
+    d = os.path.join(p, "transformers")
+    if os.path.isdir(d):
+        print("Removing:", d)
+        shutil.rmtree(d)
+
+# 2) Install a self-consistent, recent set (has EncoderDecoderCache)
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--no-cache-dir",
+                       "transformers==4.43.3", "accelerate>=0.29.3", "sentencepiece", "huggingface_hub"])
+
+# 3) Verify
+importlib.invalidate_caches()
+import transformers
+print("Transformers:", transformers.__version__, "from", transformers.__file__)
+from transformers import cache_utils
+print("Has EncoderDecoderCache?", hasattr(cache_utils, "EncoderDecoderCache"))
+
+
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+
+
+
+
+
+
+
 import transformers
 from transformers import cache_utils as _cu
 # expose the class where trainer_seq2seq expects it
