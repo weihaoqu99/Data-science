@@ -1,3 +1,17 @@
+import evaluate
+
+local_path = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/wer"
+metric = evaluate.load(local_path)
+
+preds = ["this is a test", "hello world"]
+refs  = ["this is test", "hello word"]
+
+print(metric.compute(predictions=preds, references=refs))
+
+
+
+
+
 # /appdata/cortex/dev1/shob/ASR_model/asr_finetuning/wer/wer.py
 import re
 import evaluate
