@@ -3,6 +3,124 @@ import re
 import evaluate
 import datasets
 
+_CITATION = """\
+@inproceedings{wer-metric-local,
+  title = {Simple Word Error Rate Metric},
+  author = {Local Implementation},
+  year = {2025},
+}
+"""
+
+_DESCRIPTION = "Local WER metric (pure Python, no external deps)."
+_KWARGS_DESCRIPTION = """
+Args:
+    predictions (list[str]): ASR hypotheses.
+    references  (list[str]): Gold transcripts.
+    lowercase (bool): default True. Lower-case before scoring.
+    remove_punct (bool): default True. Strip basic punctuation.
+    collapse_spaces (bool): default True. Normalize multiple spaces.
+    strip (bool): default True. Trim leading/trailing spaces.
+    detailed (bool): default True. If True, returns dict with counts; else only {'wer': float}.
+"""
+
+# --- normalization ---
+_PUNCT_RE = re.compile(r"[^\w\s]")
+
+def _normalize(s, lowercase=True, remove_punct=True, collapse_spaces=True, strip=True):
+    if s is None:
+        s = ""
+    if lowercase:
+        s = s.lower()
+    if remove_punct:
+        s = _PUNCT_RE.sub(" ", s)
+    if collapse_spaces:
+        s = re.sub(r"\s+", " ", s)
+    if strip:
+        s = s.strip()
+    return s
+
+# --- Levenshtein edit distance ---
+def _levenshtein_words(ref_words, hyp_words):
+    n, m = len(ref_words), len(hyp_words)
+    dp = [[(0,0,0,0) for _ in range(m+1)] for _ in range(n+1)]
+    for i in range(1, n+1):
+        dp[i][0] = (i, 0, 0, i)   # deletions
+    for j in range(1, m+1):
+        dp[0][j] = (j, 0, j, 0)   # insertions
+    for i in range(1, n+1):
+        for j in range(1, m+1):
+            if ref_words[i-1] == hyp_words[j-1]:
+                dp[i][j] = dp[i-1][j-1]
+            else:
+                c_sub, s_sub, i_sub, d_sub = dp[i-1][j-1]
+                sub = (c_sub+1, s_sub+1, i_sub, d_sub)
+                c_ins, s_ins, i_ins, d_ins = dp[i][j-1]
+                ins = (c_ins+1, s_ins, i_ins+1, d_ins)
+                c_del, s_del, i_del, d_del = dp[i-1][j]
+                delete = (c_del+1, s_del, i_del, d_del+1)
+                dp[i][j] = min(sub, ins, delete, key=lambda t: t[0])
+    _, S, I, D = dp[n][m]
+    return S, I, D
+
+class Wer(evaluate.Metric):
+    def _info(self):
+        return evaluate.MetricInfo(
+            description=_DESCRIPTION,
+            citation=_CITATION,   # <-- REQUIRED
+            inputs_description=_KWARGS_DESCRIPTION,
+            features=datasets.Features(
+                {
+                    "predictions": datasets.Sequence(datasets.Value("string")),
+                    "references": datasets.Sequence(datasets.Value("string")),
+                }
+            ),
+        )
+
+    def _compute(
+        self,
+        predictions,
+        references,
+        lowercase=True,
+        remove_punct=True,
+        collapse_spaces=True,
+        strip=True,
+        detailed=True,
+    ):
+        if len(predictions) != len(references):
+            raise ValueError("predictions and references must have same length")
+
+        total_S = total_I = total_D = total_N = 0
+        for hyp, ref in zip(predictions, references):
+            hyp = _normalize(hyp, lowercase, remove_punct, collapse_spaces, strip)
+            ref = _normalize(ref, lowercase, remove_punct, collapse_spaces, strip)
+            ref_words, hyp_words = ref.split(), hyp.split()
+
+            N = len(ref_words)
+            if N == 0:
+                I = len(hyp_words)
+                total_I += I
+                continue
+            S, I, D = _levenshtein_words(ref_words, hyp_words)
+            total_S += S; total_I += I; total_D += D; total_N += N
+
+        wer = (total_S + total_I + total_D) / total_N if total_N > 0 else 0.0
+        if detailed:
+            return {"wer": wer, "S": total_S, "I": total_I, "D": total_D, "N": total_N}
+        return {"wer": wer}
+
+
+
+
+
+
+
+
+
+# /appdata/cortex/dev1/shob/ASR_model/asr_finetuning/wer/wer.py
+import re
+import evaluate
+import datasets
+
 _DESCRIPTION = "Local WER metric (no external deps). Levenshtein on word tokens."
 _KWARGS_DESCRIPTION = """
 Args:
