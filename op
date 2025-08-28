@@ -1,17 +1,21 @@
 # =========================================
 # 3) OPTUNA: hyperparameter search on WER
-#    Paste this AFTER compute_metrics(...)
+#    (paste AFTER compute_metrics)
 # =========================================
-import optuna, numpy as np, json
+import json
 from pathlib import Path
+import numpy as np
+import optuna
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
 
-# ---- compatibility patch for older accelerate versions (needed by HF) ----
+# ---- (compat) patch for older accelerate versions required by transformers ----
 try:
     import accelerate.utils.memory as _acc_mem
     if not hasattr(_acc_mem, "clear_device_cache"):
         def _fallback_clear_device_cache():
             try:
-                import torch
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                     try:
@@ -25,28 +29,72 @@ try:
 except Exception as e:
     print("Could not patch accelerate:", e)
 
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, TrainerCallback, WhisperForConditionalGeneration
+# ---------- ensure Whisper has a valid decoder start token ----------
+def ensure_whisper_start_tokens(model, processor):
+    tok = processor.tokenizer
+    # Prefer Whisper's <|startoftranscript|>, else BOS
+    try:
+        start = tok.convert_tokens_to_ids("<|startoftranscript|>")
+    except Exception:
+        start = None
+    if start is None or start == tok.unk_token_id:
+        start = tok.bos_token_id
+
+    model.config.decoder_start_token_id = start
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.decoder_start_token_id = start
+
+    # Keep these simple to avoid conflicts during training
+    model.config.forced_decoder_ids = None
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.suppress_tokens = []
+
+# ---------- collator that ALWAYS supplies decoder_input_ids ----------
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+    decoder_start_token_id: int
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # acoustic features
+        input_feats = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(input_feats, return_tensors="pt")
+
+        # labels (token ids), mask padding with -100
+        label_feats = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(label_feats, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # drop leading BOS if present (trainer will shift)
+        bos_id = getattr(self.processor.tokenizer, "bos_token_id", None)
+        if bos_id is not None and labels.size(1) > 0 and torch.all(labels[:, 0] == bos_id):
+            labels = labels[:, 1:]
+
+        # build decoder_input_ids explicitly (shift-right with start token)
+        pad_id = self.processor.tokenizer.pad_token_id
+        dec_in = labels.clone()
+        dec_in[dec_in == -100] = pad_id
+        dec_in = torch.cat(
+            [torch.full((dec_in.size(0), 1), self.decoder_start_token_id, dtype=dec_in.dtype), dec_in[:, :-1]],
+            dim=1
+        )
+
+        batch["labels"] = labels
+        batch["decoder_input_ids"] = dec_in
+        return batch
+
+from transformers import (
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    TrainerCallback,
+    WhisperForConditionalGeneration,
+)
 
 SAVE_ROOT = Path("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/optuna_runs")
 SAVE_ROOT.mkdir(parents=True, exist_ok=True)
-
-# ---------- Whisper safety: set real start token + forced prompt ----------
-def prep_whisper_generation(model, processor):
-    tok = processor.tokenizer
-    # true start token for Whisper
-    start_id = tok.convert_tokens_to_ids("<|startoftranscript|>")
-    model.config.decoder_start_token_id = start_id
-    model.generation_config.decoder_start_token_id = start_id
-
-    # canonical forced prompt (language+task); avoids Trainer conflicts
-    # choose English + transcribe; change if you need other language
-    forced = processor.get_decoder_prompt_ids(language="en", task="transcribe")
-    model.config.forced_decoder_ids = forced
-    model.generation_config.forced_decoder_ids = forced
-
-    # optional: keep suppress_tokens empty like your original
-    model.config.suppress_tokens = []
-    model.generation_config.suppress_tokens = []
 
 class OptunaPruningCallback(TrainerCallback):
     def __init__(self, trial: optuna.trial.Trial, metric_name: str = "eval_wer"):
@@ -102,9 +150,13 @@ def build_args(trial: optuna.trial.Trial) -> Seq2SeqTrainingArguments:
 def objective(trial: optuna.trial.Trial) -> float:
     # fresh model per trial
     model_t = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-    # do NOT set model.config.task/language here; use the forced prompt instead
     model_t.config.use_cache = False
-    prep_whisper_generation(model_t, processor)  # <<< critical
+    ensure_whisper_start_tokens(model_t, processor)  # <<< critical
+    # per-trial collator to bind the right start token
+    collator_t = DataCollatorSpeechSeq2SeqWithPadding(
+        processor=processor,
+        decoder_start_token_id=model_t.config.decoder_start_token_id
+    )
 
     args_t = build_args(trial)
 
@@ -113,8 +165,8 @@ def objective(trial: optuna.trial.Trial) -> float:
         model=model_t,
         train_dataset=vectorized_datasets["train"],
         eval_dataset=vectorized_datasets["test"],
-        data_collator=data_collator,
-        compute_metrics=compute_metrics,   # must return {"wer": ...}
+        data_collator=collator_t,
+        compute_metrics=compute_metrics,  # must return {"wer": ...}
         tokenizer=processor,
         callbacks=[OptunaPruningCallback(trial, metric_name="eval_wer")],
     )
@@ -126,6 +178,7 @@ def objective(trial: optuna.trial.Trial) -> float:
     with open(SAVE_ROOT / f"trial_{trial.number}_metrics.json", "w") as f:
         json.dump(eval_metrics, f, indent=2)
     trainer_t.save_model(SAVE_ROOT / f"trial_{trial.number}_model")
+
     return wer
 
 # ---- run study ----
@@ -148,7 +201,7 @@ print("Best WER:", study.best_value)
 print("Best params:", study.best_params)
 
 # =========================================
-# 4) Final train with best params & save
+# 4) Final training with best params & save
 # =========================================
 from optuna.trial import FixedTrial
 
@@ -157,17 +210,24 @@ best_args.output_dir = str(SAVE_ROOT / "final_best")
 
 final_model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
 final_model.config.use_cache = False
-prep_whisper_generation(final_model, processor)  # <<< critical
+ensure_whisper_start_tokens(final_model, processor)
+collator_final = DataCollatorSpeechSeq2SeqWithPadding(
+    processor=processor,
+    decoder_start_token_id=final_model.config.decoder_start_token_id
+)
 
 final_trainer = Seq2SeqTrainer(
     args=best_args,
     model=final_model,
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
-    data_collator=data_collator,
+    data_collator=collator_final,
     compute_metrics=compute_metrics,
     tokenizer=processor,
 )
+
+print("decoder_start_token_id =", final_model.config.decoder_start_token_id,
+      "->", processor.tokenizer.decode([final_model.config.decoder_start_token_id]))
 
 final_trainer.train()
 final_trainer.save_model("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1")
