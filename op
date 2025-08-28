@@ -1,0 +1,145 @@
+# 3) OPTUNA: hyperparameter search on WER
+# =========================================
+import optuna
+import numpy as np
+import json
+from pathlib import Path
+from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, TrainerCallback
+
+SAVE_ROOT = Path("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/optuna_runs")
+SAVE_ROOT.mkdir(parents=True, exist_ok=True)
+
+class OptunaPruningCallback(TrainerCallback):
+    def __init__(self, trial: optuna.trial.Trial, metric_name: str = "eval_wer"):
+        self.trial = trial
+        self.metric_name = metric_name
+    def on_evaluate(self, args, state, control, metrics, **kwargs):
+        if self.metric_name in metrics:
+            step = int(state.global_step)
+            value = float(metrics[self.metric_name])
+            self.trial.report(value, step=step)
+            if self.trial.should_prune():
+                raise optuna.TrialPruned(f"Pruned at step {step} with {self.metric_name}={value:.4f}")
+
+def build_args(trial: optuna.trial.Trial) -> Seq2SeqTrainingArguments:
+    lr       = trial.suggest_float("learning_rate", 1e-6, 5e-5, log=True)
+    train_bs = trial.suggest_categorical("per_device_train_batch_size", [2, 4, 8])
+    grad_acc = trial.suggest_categorical("gradient_accumulation_steps", [2, 4, 8, 16])
+    max_steps = trial.suggest_int("max_steps", 300, 1200, step=100)
+    warmup_ratio = trial.suggest_float("warmup_ratio", 0.0, 0.3)
+    label_smoothing = trial.suggest_float("label_smoothing_factor", 0.0, 0.2)
+    gen_max_len = trial.suggest_int("generation_max_length", 128, 256, step=16)
+    eval_every = trial.suggest_categorical("eval_steps", [25, 50, 100])
+
+    return Seq2SeqTrainingArguments(
+        output_dir=str(SAVE_ROOT / f"trial_{trial.number}"),
+        per_device_train_batch_size=train_bs,
+        per_device_eval_batch_size=4,
+        gradient_accumulation_steps=grad_acc,
+        learning_rate=lr,
+        warmup_ratio=warmup_ratio,
+        max_steps=max_steps,
+        label_smoothing_factor=label_smoothing,
+        gradient_checkpointing=True,
+        fp16=True,
+        evaluation_strategy="steps",
+        predict_with_generate=True,
+        generation_max_length=gen_max_len,
+        seed=91,
+        logging_steps=eval_every,
+        eval_steps=eval_every,
+        save_strategy="steps",
+        save_steps=eval_every,
+        save_total_limit=1,
+        report_to=["none"],
+        load_best_model_at_end=True,
+        metric_for_best_model="wer",
+        greater_is_better=False,
+        dataloader_num_workers=8,
+        dataloader_prefetch_factor=2,
+        push_to_hub=False,
+    )
+
+def objective(trial: optuna.trial.Trial) -> float:
+    # fresh model per trial
+    model_t = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+    model_t.config.forced_decoder_ids = None
+    model_t.config.suppress_tokens = []
+    model_t.config.use_cache = False
+    model_t.config.language = "english"
+    model_t.config.task = "transcribe"
+
+    args_t = build_args(trial)
+
+    trainer_t = Seq2SeqTrainer(
+        args=args_t,
+        model=model_t,
+        train_dataset=vectorized_datasets["train"],
+        eval_dataset=vectorized_datasets["test"],
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        tokenizer=processor,
+        callbacks=[OptunaPruningCallback(trial, metric_name="eval_wer")],
+    )
+
+    trainer_t.train()
+    eval_metrics = trainer_t.evaluate()
+    wer = float(eval_metrics.get("eval_wer", np.inf))
+
+    # persist artifacts
+    with open(SAVE_ROOT / f"trial_{trial.number}_metrics.json", "w") as f:
+        json.dump(eval_metrics, f, indent=2)
+    trainer_t.save_model(SAVE_ROOT / f"trial_{trial.number}_model")
+
+    return wer
+
+# Run Optuna study
+sampler = optuna.samplers.TPESampler(seed=91, multivariate=True, group=True)
+pruner  = optuna.pruners.MedianPruner(n_warmup_steps=2)
+
+study = optuna.create_study(
+    study_name="whisper_distil_optuna_wer",
+    direction="minimize",
+    sampler=sampler,
+    pruner=pruner,
+    storage=f"sqlite:///{SAVE_ROOT}/optuna_whisper.db",
+    load_if_exists=True,
+)
+
+N_TRIALS = 8  # adjust as you like
+study.optimize(objective, n_trials=N_TRIALS, gc_after_trial=True)
+
+print("Best WER:", study.best_value)
+print("Best params:", study.best_params)
+
+# =========================================
+# 4) Final training with best params (saved to your path)
+# =========================================
+from optuna.trial import FixedTrial
+
+best_args = build_args(FixedTrial(study.best_params))
+best_args.output_dir = str(SAVE_ROOT / "final_best")
+
+final_model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+final_model.config.forced_decoder_ids = None
+final_model.config.suppress_tokens = []
+final_model.config.use_cache = False
+final_model.config.language = "english"
+final_model.config.task = "transcribe"
+
+final_trainer = Seq2SeqTrainer(
+    args=best_args,
+    model=final_model,
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor,
+)
+
+final_trainer.train()
+final_trainer.save_model("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1")
+
+
+
+
