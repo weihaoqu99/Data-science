@@ -1,3 +1,73 @@
+# ===== Evaluate saved model on test set and export CSV =====
+import numpy as np
+import pandas as pd
+from transformers import WhisperForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+SAVED_MODEL_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1"
+CSV_OUT = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/test_predictions_v1.csv"
+
+# 1) Reload model you just saved (processor stays the same as above)
+eval_model = WhisperForConditionalGeneration.from_pretrained(SAVED_MODEL_DIR)
+
+# 2) Rebuild a lightweight eval-only trainer (no training)
+eval_args = Seq2SeqTrainingArguments(
+    output_dir="./test_eval_out",
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    fp16=True,
+    report_to=["none"],
+)
+
+eval_trainer = Seq2SeqTrainer(
+    args=eval_args,
+    model=eval_model,
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    tokenizer=processor,
+    compute_metrics=compute_metrics,
+)
+
+# 3) Overall test metrics
+test_metrics = eval_trainer.evaluate()
+print("Test metrics:", {k: float(v) for k, v in test_metrics.items()})  # includes 'eval_wer'
+
+# 4) Per-sample predictions
+pred = eval_trainer.predict(vectorized_datasets["test"])
+pred_ids = pred.predictions
+label_ids = pred.label_ids
+
+# 5) Decode predictions/labels
+label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+pred_str  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
+label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+# 6) Per-utterance WER and CSV
+import evaluate
+wer_metric = evaluate.load("wer")
+rows = []
+test_raw = raw_datasets["test"]  # has 'audio' + 'sentence'
+for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
+    w = 100 * wer_metric.compute(predictions=[hyp], references=[ref])
+    rows.append({
+        "idx": i,
+        "audio": test_raw[i]["audio"]["path"],
+        "reference": ref,
+        "prediction": hyp,
+        "wer": round(w, 2)
+    })
+
+df = pd.DataFrame(rows)
+df.to_csv(CSV_OUT, index=False, encoding="utf-8")
+print("Saved detailed predictions to:", CSV_OUT)
+
+
+
+
+
+
+
+
 # === Test set eval + CSV export ===
 import numpy as np
 import pandas as pd
