@@ -1,3 +1,53 @@
+# === Test set eval + CSV export ===
+import numpy as np
+import pandas as pd
+import evaluate
+
+# 1) Overall metrics (WER, loss)
+test_metrics = trainer.evaluate(eval_dataset=vectorized_datasets["test"])
+print("Test metrics:", {k: float(v) for k, v in test_metrics.items()})
+
+# 2) Per-sample predictions
+pred = trainer.predict(
+    vectorized_datasets["test"],
+    max_length=training_args.generation_max_length
+)
+pred_ids  = pred.predictions
+label_ids = pred.label_ids
+
+# 3) Decode predictions/labels
+label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+pred_str  = processor.tokenizer.batch_decode(pred_ids,  skip_special_tokens=True)
+label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+# 4) Per-utterance WER
+wer_metric = evaluate.load("wer")
+utt_wer = [100 * wer_metric.compute(predictions=[p], references=[r])
+           for p, r in zip(pred_str, label_str)]
+
+# 5) Build table (include original audio path)
+rows = []
+test_raw = raw_datasets["test"]   # still has 'audio' & 'sentence'
+for i, (hyp, ref, w) in enumerate(zip(pred_str, label_str, utt_wer)):
+    audio_path = test_raw[i]["audio"]["path"]
+    rows.append({
+        "idx": i,
+        "audio": audio_path,
+        "reference": ref,
+        "prediction": hyp,
+        "wer": round(w, 2)
+    })
+
+df = pd.DataFrame(rows)
+csv_path = "./test_predictions.csv"
+df.to_csv(csv_path, index=False, encoding="utf-8")
+print("Saved detailed predictions to:", csv_path)
+
+
+
+
+
+
 # Overall WER on test split
 test_metrics = trainer.evaluate(eval_dataset=vectorized_datasets["test"])
 print("Test metrics:", test_metrics)   # {'eval_loss': ..., 'eval_wer': ...}
