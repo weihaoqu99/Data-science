@@ -1,3 +1,12 @@
+# Overall WER on test split
+test_metrics = trainer.evaluate(eval_dataset=vectorized_datasets["test"])
+print("Test metrics:", test_metrics)   # {'eval_loss': ..., 'eval_wer': ...}
+
+
+
+
+
+
 import os
 LIBDIR = "/appdata/cortex/dev4/shobha/lib"  # where you copied it on 6880
 os.environ["SNDFILE_LIBRARY"] = f"{LIBDIR}/libsndfile.so"
