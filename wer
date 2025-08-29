@@ -1,3 +1,20 @@
+import os, sys
+# path where libsndfile.so actually lives:
+LIBSNDFILE_DIR = "/appdata/cortex/dev4/shobha/lib"  # <-- adjust if different
+LIBSNDFILE_PATH = os.path.join(LIBSNDFILE_DIR, "libsndfile.so")
+
+# Make sure the file exists
+assert os.path.exists(LIBSNDFILE_PATH), f"Missing: {LIBSNDFILE_PATH}"
+
+# Tell soundfile where to find it
+os.environ["SNDFILE_LIBRARY"] = LIBSNDFILE_PATH
+
+# also make the dynamic loader see it
+os.environ["LD_LIBRARY_PATH"] = LIBSNDFILE_DIR + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+
+
+
+
 # /appdata/cortex/dev1/shob/ASR_model/asr_finetuning/wer/wer.py
 import re
 import evaluate
