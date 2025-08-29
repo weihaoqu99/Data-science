@@ -1,3 +1,18 @@
+import os
+LIBDIR = "/appdata/cortex/dev4/shobha/lib"  # where you copied it on 6880
+os.environ["SNDFILE_LIBRARY"] = f"{LIBDIR}/libsndfile.so"
+os.environ["LD_LIBRARY_PATH"] = LIBDIR + ":" + os.environ.get("LD_LIBRARY_PATH", "")
+
+# quick check
+import soundfile as sf
+print("libsndfile:", getattr(sf, "__libsndfile_version__", "unknown"))
+
+
+
+
+
+
+
 import os, sys
 # path where libsndfile.so actually lives:
 LIBSNDFILE_DIR = "/appdata/cortex/dev4/shobha/lib"  # <-- adjust if different
