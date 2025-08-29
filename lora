@@ -1,6 +1,28 @@
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
+# ===== accelerate hot-patch (needed on older accelerate versions) =====  # NEW
+import sys, types  # NEW
+def _safe_clear_device_cache():  # NEW
+    try:  # NEW
+        import torch  # NEW
+        if torch.cuda.is_available():  # NEW
+            torch.cuda.empty_cache()  # NEW
+            try: torch.cuda.ipc_collect()  # NEW
+            except Exception: pass  # NEW
+    except Exception: pass  # NEW
+try:  # NEW
+    import accelerate.utils.memory as _acc_mem  # NEW
+    if not hasattr(_acc_mem, "clear_device_cache"):  # NEW
+        _acc_mem.clear_device_cache = _safe_clear_device_cache  # NEW
+        print("Patched accelerate.utils.memory.clear_device_cache")  # NEW
+except Exception:  # NEW
+    mem_mod = types.ModuleType("accelerate.utils.memory")  # NEW
+    mem_mod.clear_device_cache = _safe_clear_device_cache  # NEW
+    sys.modules["accelerate.utils.memory"] = mem_mod  # NEW
+    print("Injected accelerate.utils.memory module with clear_device_cache")  # NEW
+# ======================================================================  # NEW
+
 from datasets import Dataset, Audio
 import glob
 
@@ -49,6 +71,7 @@ vectorized_datasets = raw_datasets.map(
 )
 
 from transformers import WhisperForConditionalGeneration
+
 model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
@@ -56,29 +79,29 @@ model.config.use_cache = False
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# ---------- LoRA additions ----------
-# NEW: ensure decoder has a valid start token (safer for training)
+# ----- decoder start-token safety (helps training/generation) -----      # NEW
 tok = processor.tokenizer  # NEW
 start_id = tok.convert_tokens_to_ids("<|startoftranscript|>")  # NEW
-if (start_id is None) or (hasattr(tok, "unk_token_id") and start_id == tok.unk_token_id):  # NEW
+if start_id is None or (hasattr(tok, "unk_token_id") and start_id == tok.unk_token_id):  # NEW
     start_id = tok.bos_token_id  # NEW
 if model.config.decoder_start_token_id is None:  # NEW
     model.config.decoder_start_token_id = start_id  # NEW
+# -----------------------------------------------------------------      # NEW
 
-# NEW: import and apply LoRA (rank=64, alpha=32)
+# -------------------- LoRA: r=64, alpha=32 ----------------------------- # NEW
 from peft import LoraConfig, get_peft_model  # NEW
 
-lora_cfg = LoraConfig(  # NEW
-    r=64,                 # NEW
-    lora_alpha=32,        # NEW
-    lora_dropout=0.0,     # NEW (set 0.05 if you want dropout)
-    bias="none",          # NEW
-    task_type="SEQ_2_SEQ_LM",  # NEW
-    target_modules=["q_proj","k_proj","v_proj","out_proj","fc1","fc2"],  # NEW
-    use_rslora=False      # NEW (true LoRA, no rank stabilization)
-)  # NEW
-model = get_peft_model(model, lora_cfg)  # NEW
-model.print_trainable_parameters()        # NEW
+lora_cfg = LoraConfig(                 # NEW
+    r=64,                              # NEW
+    lora_alpha=32,                     # NEW
+    lora_dropout=0.0,                  # NEW  (use 0.05 if you want dropout)
+    bias="none",                       # NEW
+    task_type="SEQ_2_SEQ_LM",          # NEW
+    target_modules=["q_proj","k_proj","v_proj","out_proj","fc1","fc2"]  # NEW
+)                                      # NEW
+model = get_peft_model(model, lora_cfg)           # NEW
+model.print_trainable_parameters()                 # NEW
+# ---------------------------------------------------------------------  # NEW
 
 import torch
 from dataclasses import dataclass
@@ -98,10 +121,8 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
 
-        # CHANGED: safer BOS-trim check (use tokenizer.bos_token_id, not decoder_start_token_id)
-        bos_id = getattr(self.processor.tokenizer, "bos_token_id", None)  # CHANGED
-        if bos_id is not None and labels.size(1) > 0 and torch.all(labels[:, 0] == bos_id):  # CHANGED
-            labels = labels[:, 1:]  # CHANGED
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
 
         batch["labels"] = labels
         return batch
@@ -159,7 +180,7 @@ from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
-    model=model,  # (LoRA-wrapped PEFT model)  # NEW (comment)
+    model=model,                           # NEW: PEFT (LoRA) model
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
@@ -169,9 +190,8 @@ trainer = Seq2SeqTrainer(
 
 trainer.train()
 
-# CHANGED: save to a LoRA-specific folder and also save the processor (for inference)
-save_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_lora64a32"  # NEW
-trainer.save_model(save_dir)        # CHANGED (was a fixed path before)
-processor.save_pretrained(save_dir) # NEW (so you can load processor from the same folder)
-print("Saved to:", save_dir)        # NEW
-
+# (optional) different save path to avoid overwriting a non-LoRA run        # CHANGED
+save_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_lora64a32"  # CHANGED
+trainer.save_model(save_dir)    # CHANGED
+processor.save_pretrained(save_dir)  # NEW
+print("Saved to:", save_dir)    # NEW
