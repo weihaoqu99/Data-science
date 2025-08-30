@@ -1,16 +1,26 @@
-import optuna
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer, TrainerCallback
+# ================================
+# OPTUNA: hyperparameter search
+# ================================
+from pathlib import Path
+import numpy as np
+import optuna, torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+from transformers import (
+    Seq2SeqTrainingArguments, Seq2SeqTrainer, TrainerCallback,
+    WhisperForConditionalGeneration
+)
 
 SAVE_ROOT = Path("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/optuna_fast")
 SAVE_ROOT.mkdir(parents=True, exist_ok=True)
 
-# speed knobs
-N_TRIALS        = 3
-SUBSET_FRAC     = 0.20
+# ---- speed knobs (tune these) ----
+N_TRIALS        = 3        # try 6–12 when you want more thorough search
+SUBSET_FRAC     = 0.20     # set 1.0 to use full dataset per trial
 MAX_STEPS_TRIAL = 200
 EVAL_STEPS      = 100
 GEN_MAX_LEN     = 96
-SAVE_DURING     = False  # no checkpointing inside trials
+# ----------------------------------
 
 def subset_split(dsets, frac: float):
     n_tr = max(1, int(len(dsets["train"]) * frac))
@@ -22,19 +32,72 @@ def subset_split(dsets, frac: float):
 
 trial_datasets = subset_split(vectorized_datasets, SUBSET_FRAC)
 
+# --- make sure decoder has a valid start token & no forced IDs ---
+def ensure_whisper_start_tokens(model, processor):
+    tok = processor.tokenizer
+    try:
+        start = tok.convert_tokens_to_ids("<|startoftranscript|>")
+    except Exception:
+        start = None
+    if start is None or start == getattr(tok, "unk_token_id", -999999):
+        start = tok.bos_token_id
+    if model.config.decoder_start_token_id is None:
+        model.config.decoder_start_token_id = start
+    if getattr(model, "generation_config", None) is not None:
+        model.generation_config.decoder_start_token_id = start
+        model.generation_config.forced_decoder_ids = None
+        model.generation_config.suppress_tokens = []
+    model.config.forced_decoder_ids = None
+    model.config.suppress_tokens = []
+    model.config.use_cache = False
+    model.config.language = "english"
+    model.config.task = "transcribe"
+
+# --- collator that ALSO builds decoder_input_ids (avoids forward error) ---
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPaddingOpt:
+    processor: Any
+    decoder_start_token_id: int
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # acoustic features
+        input_feats = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(input_feats, return_tensors="pt")
+
+        # labels
+        label_feats = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(label_feats, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # decoder_input_ids = shift-right(labels) with start token
+        pad_id = self.processor.tokenizer.pad_token_id
+        dec_in = labels.clone()
+        dec_in[dec_in == -100] = pad_id
+        dec_in = torch.cat(
+            [torch.full((dec_in.size(0), 1), self.decoder_start_token_id, dtype=dec_in.dtype), dec_in[:, :-1]],
+            dim=1
+        )
+
+        batch["labels"] = labels
+        batch["decoder_input_ids"] = dec_in
+        return batch
+
+# --- Optuna pruning callback (on eval WER) ---
 class OptunaPruningCallback(TrainerCallback):
     def __init__(self, trial: optuna.trial.Trial, metric_name: str = "eval_wer"):
-        self.trial = trial; self.metric_name = metric_name
+        self.trial = trial
+        self.metric_name = metric_name
     def on_evaluate(self, args, state, control, metrics, **kwargs):
         if self.metric_name in metrics:
             self.trial.report(float(metrics[self.metric_name]), step=int(state.global_step))
             if self.trial.should_prune():
-                raise optuna.TrialPruned()
+                raise optuna.TrialPruned(f"Pruned at step {int(state.global_step)}")
 
+# --- Training args search space (fast) ---
 def build_args(trial: optuna.trial.Trial) -> Seq2SeqTrainingArguments:
     lr       = trial.suggest_float("learning_rate", 1e-6, 2e-5, log=True)
     train_bs = trial.suggest_categorical("per_device_train_batch_size", [2, 4])
     grad_acc = trial.suggest_categorical("gradient_accumulation_steps", [2, 4])
+
     return Seq2SeqTrainingArguments(
         output_dir=str(SAVE_ROOT / f"trial_{trial.number}"),
         per_device_train_batch_size=train_bs,
@@ -49,12 +112,11 @@ def build_args(trial: optuna.trial.Trial) -> Seq2SeqTrainingArguments:
         evaluation_strategy="steps",
         predict_with_generate=True,
         generation_max_length=GEN_MAX_LEN,
-        generation_num_beams=1,
+        generation_num_beams=1,   # greedy decode = fastest
         seed=91,
         logging_steps=EVAL_STEPS,
         eval_steps=EVAL_STEPS,
-        save_strategy="no" if not SAVE_DURING else "steps",
-        save_total_limit=1,
+        save_strategy="no",       # no checkpoints inside trials
         report_to=["none"],
         load_best_model_at_end=False,
         metric_for_best_model="wer",
@@ -66,11 +128,12 @@ def build_args(trial: optuna.trial.Trial) -> Seq2SeqTrainingArguments:
         save_safetensors=True,
     )
 
+# --- objective: train per trial and return WER ---
 def objective(trial: optuna.trial.Trial) -> float:
     model_t = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
     ensure_whisper_start_tokens(model_t, processor)
 
-    collator_t = DataCollatorSpeechSeq2SeqWithPadding(
+    collator_t = DataCollatorSpeechSeq2SeqWithPaddingOpt(
         processor=processor,
         decoder_start_token_id=model_t.config.decoder_start_token_id
     )
@@ -89,28 +152,28 @@ def objective(trial: optuna.trial.Trial) -> float:
 
     trainer_t.train()
     eval_metrics = trainer_t.evaluate()
-    return float(eval_metrics.get("eval_wer", 9e9))
+    return float(eval_metrics.get("eval_wer", np.inf))
 
+# --- run study ---
 sampler = optuna.samplers.TPESampler(seed=91, multivariate=True, group=True)
 pruner  = optuna.pruners.MedianPruner(n_warmup_steps=1)
 study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner,
                             study_name="whisper_fast_optuna_wer")
 study.optimize(objective, n_trials=N_TRIALS, gc_after_trial=True)
+
 print("FAST Best WER:", study.best_value)
 print("FAST Best params:", study.best_params)
 
-# ============================================
-# 8) Final train on FULL data using best params
-# ============================================
+# --- FINAL: train on FULL data using best params & save ---
 from optuna.trial import FixedTrial
+FINAL_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_Optuna_v1"
 
 best_args = build_args(FixedTrial(study.best_params))
-FINAL_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_Optuna_v1"
 best_args.output_dir = FINAL_DIR
-best_args.save_strategy = "steps"
+best_args.save_strategy = "steps"      # enable saving now
 best_args.eval_steps    = 200
 best_args.logging_steps = 200
-best_args.max_steps     = 800           # you can raise this for better quality
+best_args.max_steps     = 800          # raise for better quality
 best_args.load_best_model_at_end = True
 best_args.metric_for_best_model = "wer"
 best_args.greater_is_better     = False
@@ -118,12 +181,17 @@ best_args.greater_is_better     = False
 final_model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
 ensure_whisper_start_tokens(final_model, processor)
 
+collator_final = DataCollatorSpeechSeq2SeqWithPaddingOpt(
+    processor=processor,
+    decoder_start_token_id=final_model.config.decoder_start_token_id
+)
+
 final_trainer = Seq2SeqTrainer(
     args=best_args,
     model=final_model,
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
-    data_collator=data_collator,
+    data_collator=collator_final,
     compute_metrics=compute_metrics,
     tokenizer=processor,
 )
