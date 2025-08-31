@@ -1,3 +1,7 @@
+
+import torch; 
+if hasattr(torch.cuda, "clear_memory_allocated"): delattr(torch.cuda, "clear_memory_allocated")
+
 # --- TEMP PATCH: only if you cannot upgrade accelerate ---
 try:
     import accelerate.utils.memory as _acc_mem
