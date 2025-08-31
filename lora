@@ -188,41 +188,30 @@ training_args = Seq2SeqTrainingArguments(
     remove_unused_columns=False,   # <<< critical
 )
 
-# ================== TRAINER HARDENING ==================
+# ================== TRAINER (STRICT FILTER) ==================
 from transformers import Seq2SeqTrainer
 WHISPER_ALLOWED = {
     "input_features", "decoder_input_ids", "labels",
     "attention_mask", "decoder_attention_mask"
 }
 
-class WhisperTrainer(Seq2SeqTrainer):
+class WhisperTrainerStrict(Seq2SeqTrainer):
     def _prepare_inputs(self, inputs):
         inputs = super()._prepare_inputs(inputs)
-        # strip anything Whisper doesn't accept (e.g., 'input_ids')
+        # Drop any keys Whisper doesn't support
         return {k: v for k, v in inputs.items() if k in WHISPER_ALLOWED}
 
-# Final guard: wrapper that drops stray keys at the very last moment
-import torch.nn as nn
-class WhisperWrapper(nn.Module):
-    def __init__(self, base):
-        super().__init__()
-        self.base = base
-    def forward(self, **kwargs):
-        # Remove keys Whisper/PEFT shouldn't see
-        kwargs.pop("input_ids", None)
-        kwargs.pop("encoder_inputs", None)
-        kwargs.pop("encoder_input_ids", None)
-        return self.base(**kwargs)
-    # preserve generate/config/attributes
-    def generate(self, *args, **kwargs):
-        return self.base.generate(*args, **kwargs)
-    def __getattr__(self, name):
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self.base, name)
+    def compute_loss(self, model, inputs, return_outputs=False):
+        # Ensure filtered dict even if something upstream re-injects keys
+        inputs = {k: v for k, v in inputs.items() if k in WHISPER_ALLOWED}
+        outputs = model(**inputs)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+        return (loss, outputs) if return_outputs else loss
 
-model = WhisperWrapper(model)  # <<< wrap PEFT model
+    def prediction_step(self, model, inputs, prediction_loss_only, ignore_keys=None):
+        # Filter before eval/generate too
+        inputs = self._prepare_inputs(inputs)
+        return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)
 
 # (optional) sanity-check the collator output
 sample = [vectorized_datasets["train"][0]]
@@ -230,20 +219,20 @@ b = data_collator(sample)
 print("Batch keys:", list(b.keys()))  # expect: input_features, labels, decoder_input_ids
 
 # ================== TRAIN ==================
-trainer = WhisperTrainer(
+trainer = WhisperTrainerStrict(
     args=training_args,
     model=model,
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,
-    tokenizer=processor,   # ok to keep for decoding in metrics
+    tokenizer=processor,   # used for decoding in metrics
 )
 
 trainer.train()
 
 # ================== SAVE ==================
-SAVE_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_LoRA_r64_a32_v1"
+SAVE_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_LoRA_r64_a32_v2"
 trainer.save_model(SAVE_DIR)
 processor.save_pretrained(SAVE_DIR)
 print("Saved to:", SAVE_DIR)
