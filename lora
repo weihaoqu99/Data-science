@@ -1,3 +1,21 @@
+# --- TEMP PATCH: only if you cannot upgrade accelerate ---
+try:
+    import accelerate.utils.memory as _acc_mem
+    if not hasattr(_acc_mem, "clear_device_cache"):
+        def _clear_device_cache():
+            try:
+                from accelerate.utils import get_accelerator
+                get_accelerator().empty_cache()
+            except Exception:
+                pass
+        _acc_mem.clear_device_cache = _clear_device_cache
+except Exception:
+    pass
+# ---------------------------------------------------------
+
+
+
+
 import os
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
