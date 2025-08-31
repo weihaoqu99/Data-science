@@ -1,7 +1,7 @@
 # =========================
-# Whisper ASR fine-tuning (minimal changes)
+# Whisper ASR fine-tuning (minimal changes, disk-safe)
 # =========================
-import os, glob, pathlib
+import os, glob, pathlib, shutil
 os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
 
 from typing import Any, Dict, List, Union
@@ -21,9 +21,16 @@ from transformers import (
 # Paths (match your setup)
 # -------------------------
 AUDIO_GLOB  = "/appdata/cortex/dev1/origAudio/*.mp3"
-WHISPER_LOC = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"  # your local base
+WHISPER_LOC = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"  # local model/processor
 OUTPUT_DIR  = "/appdata/cortex/dev1/shob/ASR_model/checkpoints/whisper_run1"
 pathlib.Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# (optional but helpful) fail early if very low space
+try:
+    _, _, free = shutil.disk_usage(OUTPUT_DIR)
+    print(f"[disk] Free space at {OUTPUT_DIR}: {free/1e9:.2f} GB")
+except Exception:
+    pass
 
 # -------------------------
 # Build dataset from filenames
@@ -60,22 +67,25 @@ model = WhisperForConditionalGeneration.from_pretrained(WHISPER_LOC)
 # keep your config fixes
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
-model.config.use_cache = False          # for grad ckpt
+model.config.use_cache = False          # for grad checkpointing
 model.config.language = "english"
 model.config.task = "transcribe"
 
 # -------------------------
 # Vectorization
-# (FIX: no walrus operator; assign first)
+# (FIX 1: no walrus operator; assign first)
+# (FIX 2: feature_extractor takes the raw waveform as FIRST POSITIONAL ARG, not audio=)
 # -------------------------
 def prepare_dataset(batch):
     audio = batch["audio"]
-    audio_array = audio["array"]                 # ← was: audio=array := audio["array"]
+    audio_array = audio["array"]
     sr = audio["sampling_rate"]
+
     batch["input_features"] = processor.feature_extractor(
-        audio=audio_array,
+        audio_array,                 # raw_speech positional arg
         sampling_rate=sr
     ).input_features[0]
+
     transcription = batch["sentence"]
     batch["labels"] = processor.tokenizer(transcription).input_ids
     return batch
@@ -87,7 +97,7 @@ vectorized_datasets = raw_datasets.map(
 )
 
 # -------------------------
-# Data collator (same as yours)
+# Data collator (same logic as yours)
 # -------------------------
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -124,7 +134,7 @@ def compute_metrics(pred):
 
 # -------------------------
 # Training arguments
-# (MINIMAL changes to avoid the step-500 save crash)
+# (disk-safe: save once per epoch, keep 1, safetensors)
 # -------------------------
 training_args = Seq2SeqTrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -149,11 +159,10 @@ training_args = Seq2SeqTrainingArguments(
     logging_steps=50,
     report_to=["none"],
 
-    # ---- critical save tweaks ----
-    save_strategy="epoch",          # save once per epoch (not every few steps)
-    save_total_limit=1,             # keep only the latest checkpoint
-    load_best_model_at_end=False,   # avoids extra copies
-    save_safetensors=True,
+    save_strategy="epoch",          # << avoids frequent large writes
+    save_total_limit=1,             # keep only latest checkpoint
+    load_best_model_at_end=False,   # avoid extra copies
+    save_safetensors=True,          # smaller & safer
 
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
@@ -162,7 +171,7 @@ training_args = Seq2SeqTrainingArguments(
 )
 
 # -------------------------
-# Trainer (minimal change: use Adafactor for tiny optimizer state)
+# Trainer (use Adafactor for tiny optimizer state)
 # -------------------------
 trainer = Seq2SeqTrainer(
     args=training_args,
@@ -172,7 +181,7 @@ trainer = Seq2SeqTrainer(
     data_collator=data_collator,
     tokenizer=processor,
     compute_metrics=compute_metrics,
-    optim="adafactor",   # <<< keeps checkpoints tiny; reduces disk writes
+    optim="adafactor",   # keeps optimizer state & checkpoints small
 )
 
 # -------------------------
