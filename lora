@@ -80,7 +80,31 @@ model.config.use_cache = False  # incompatible with gradient checkpointing (memo
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# ---------- NEW CHANGE: LoRA (enable = True, rank=64, alpha=32) ----------
+# ---------- NEW CHANGE (FIX): make PEFT import work even if accelerate lacks clear_device_cache ----------
+# If accelerate doesn't expose accelerate.utils.memory.clear_device_cache (older versions),
+# create a tiny shim so PEFT can import successfully.
+import sys, types, gc
+try:
+    from accelerate.utils.memory import clear_device_cache  # noqa: F401
+except Exception:
+    try:
+        import torch as _torch
+        _mod = types.ModuleType("accelerate.utils.memory")
+        def clear_device_cache():
+            try:
+                _torch.cuda.empty_cache()
+                if hasattr(_torch.cuda, "ipc_collect"):
+                    _torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            gc.collect()
+        _mod.clear_device_cache = clear_device_cache
+        sys.modules["accelerate.utils.memory"] = _mod
+    except Exception:
+        pass
+# -------------------------------------------------------------------------------------------------------
+
+# ---------- NEW CHANGE (LoRA enabled = True, rank=64, alpha=32) ----------
 from peft import LoraConfig, get_peft_model
 
 lora_cfg = LoraConfig(
@@ -92,7 +116,7 @@ lora_cfg = LoraConfig(
     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # attention projections
 )
 model = get_peft_model(model, lora_cfg)
-model.print_trainable_parameters()  # optional: sanity check
+# model.print_trainable_parameters()  # optional sanity check
 # ------------------------------------------------------------------------
 
 @dataclass
@@ -200,7 +224,7 @@ from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
-    model=model,  # <- PEFT-wrapped model
+    model=model,  # PEFT-wrapped model
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
@@ -212,7 +236,7 @@ trainer.train()
 
 # (Optional) final save:
 # For LoRA, save just the adapter (recommended)
-# adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # <<< NEW CHANGE
+# adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
 # trainer.model.save_pretrained(adapter_dir)
 
 
@@ -223,15 +247,15 @@ import numpy as np
 import pandas as pd
 from transformers import WhisperForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
 
-# If you saved the adapter as above, set these:
+# If you saved the adapter above, set these:
 SAVED_BASE_DIR = whisper_loc
-SAVED_ADAPTER_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # <<< NEW CHANGE
+SAVED_ADAPTER_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
 CSV_OUT = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/test_predictions_v1_Shob.csv"
 
-# 1) Reload base model then attach LoRA adapter  <<< NEW CHANGE
+# 1) Reload base model then attach LoRA adapter
+from peft import PeftModel
 base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
-from peft import PeftModel  # <<< NEW CHANGE
-eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)  # <<< NEW CHANGE
+eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
 
 # 2) Rebuild a lightweight eval-only trainer (no training)
 eval_args = Seq2SeqTrainingArguments(
@@ -285,3 +309,4 @@ for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
 df = pd.DataFrame(rows)
 df.to_csv(CSV_OUT, index=False, encoding="utf-8")
 print("Saved detailed predictions to:", CSV_OUT)
+
