@@ -1,4 +1,6 @@
-# ------------------------- YOUR ORIGINAL CODE (unchanged) -------------------------
+# ==========================================
+# 1) Imports & audio listing
+# ==========================================
 import os
 os.environ['CUDA_VISIBLE_DEVICES'] = "1"
 
@@ -29,145 +31,257 @@ raw_datasets = Dataset.from_dict({
 
 raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
 raw_datasets
-# ----------------------------------------------------------------------------------
 
 
-# ============================== NEW: LoRA + training ==============================
+# ==========================================
+# 2) Whisper processor & dataset vectorization
+# ==========================================
+from transformers import WhisperProcessor
 
-# NEW: flags & LoRA hyperparams you asked for
-USE_LORA = True            # <--- NEW
-LORA_R = 64                # <--- NEW
-LORA_ALPHA = 32            # <--- NEW
-LORA_DROPOUT = 0.05        # <--- NEW
-
-# NEW: core imports for ASR fine-tuning with LoRA
-import torch                                  # <--- NEW
-from transformers import (                    # <--- NEW
-    AutoProcessor,
-    AutoModelForSpeechSeq2Seq,
-    Seq2SeqTrainer,
-    Seq2SeqTrainingArguments
+# use your local copy (from screenshot)
+whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
+processor = WhisperProcessor.from_pretrained(
+    whisper_loc, language="English", task="transcribe"
 )
-# NEW: data collator (use library if available; otherwise a tiny fallback)
-try:                                          # <--- NEW
-    from transformers import DataCollatorSpeechSeq2SeqWithPadding
-    _HAS_DC = True
-except Exception:
-    _HAS_DC = False
 
-# NEW: PEFT (LoRA)
-from peft import LoraConfig, get_peft_model    # <--- NEW
-
-# NEW: pick a Whisper-style checkpoint (you can swap to your usual model)
-# If you typically use Distil-Whisper large v2 + LoRA, this matches your setup.
-MODEL_ID = "distil-whisper/distil-large-v2"    # <--- NEW (change if you use a different ckpt)
-
-# NEW: processor & model
-processor = AutoProcessor.from_pretrained(MODEL_ID)   # <--- NEW
-model = AutoModelForSpeechSeq2Seq.from_pretrained(
-    MODEL_ID,
-    torch_dtype=torch.float16,
-    low_cpu_mem_usage=True
-).to("cuda")                                           # <--- NEW
-
-# NEW: helpful Whisper settings so training isn’t constrained
-model.config.forced_decoder_ids = None                 # <--- NEW
-model.config.suppress_tokens = []                      # <--- NEW
-
-# NEW: apply LoRA if requested
-if USE_LORA:                                           # <--- NEW
-    lora_cfg = LoraConfig(
-        r=LORA_R,
-        lora_alpha=LORA_ALPHA,
-        lora_dropout=LORA_DROPOUT,
-        bias="none",
-        task_type="SEQ_2_SEQ_LM",
-        # common attention projections for Whisper/seq2seq
-        target_modules=["q_proj", "v_proj"]
-    )
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()  # sanity check in logs
-
-# NEW: prepare features/labels from your raw_datasets (no changes to your original construction)
-def _prepare_batch(batch):                              # <--- NEW
-    # batch["audio"] is a dict from datasets Audio() with "array" and "sampling_rate"
+def prepare_dataset(batch):
+    # Load and (possibly) resample audio to 16kHz
     audio = batch["audio"]
-    inputs = processor(
-        audio["array"],
-        sampling_rate=audio["sampling_rate"],
-        return_tensors="pt"
-    )
-    with processor.as_target_tokenizer():
-        labels = processor.tokenizer(batch["sentence"]).input_ids
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
 
-    batch["input_features"] = inputs.input_features[0]
-    batch["labels"] = labels
+    # optional pre-processing
+    transcription = batch["sentence"]
+
+    # encode target text to label ids
+    batch["labels"] = processor.tokenizer(transcription).input_ids
     return batch
 
-# Map to add input_features + labels; keep your original columns intact until we remove them for Trainer
-train_ds = raw_datasets["train"].map(                  # <--- NEW
-    _prepare_batch,
-    remove_columns=[],
-    desc="Preparing train features"
-)
-eval_ds = raw_datasets["test"].map(                    # <--- NEW
-    _prepare_batch,
-    remove_columns=[],
-    desc="Preparing eval features"
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets["train"].column_names,
+    num_proc=8
 )
 
-# NEW: data collator (library or minimal fallback)
-if _HAS_DC:                                            # <--- NEW
-    data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
-else:
-    # Minimal padding for input_features & labels if the class isn’t available
-    from torch.nn.utils.rnn import pad_sequence
-    def data_collator(features):
-        # input_features: list of FloatTensor [feature_len, feature_dim]
-        input_features = [torch.tensor(f["input_features"]) for f in features]
-        # pad to max length along time dimension
-        input_features = pad_sequence(input_features, batch_first=True)
-        # labels are int lists
-        labels = [torch.tensor(f["labels"], dtype=torch.long) for f in features]
-        labels = pad_sequence(labels, batch_first=True, padding_value=processor.tokenizer.pad_token_id)
-        return {
-            "input_features": input_features,
-            "labels": labels
-        }
 
-# NEW: training args (tune to your infra/paths)
-output_dir = "/appdata/cortex/dev1/ASR_model/lora_distil_large_v2_r64a32"  # <--- NEW
-training_args = Seq2SeqTrainingArguments(                                  # <--- NEW
-    output_dir=output_dir,
-    per_device_train_batch_size=8,
-    per_device_eval_batch_size=8,
-    gradient_accumulation_steps=2,
-    learning_rate=1e-4,
+# ==========================================
+# 3) Model config and custom data collator
+# ==========================================
+from transformers import WhisperForConditionalGeneration
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+model.config.forced_decoder_ids = None
+model.config.suppress_tokens = []
+model.config.use_cache = False  # incompatible with gradient checkpointing (memory savings)
+model.config.language = "english"
+model.config.task = "transcribe"
+
+# ---------- NEW CHANGE: LoRA (enable = True, rank=64, alpha=32) ----------
+from peft import LoraConfig, get_peft_model
+
+lora_cfg = LoraConfig(
+    r=64,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    bias="none",
+    task_type="SEQ_2_SEQ_LM",
+    target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # attention projections
+)
+model = get_peft_model(model, lora_cfg)
+model.print_trainable_parameters()  # optional: sanity check
+# ------------------------------------------------------------------------
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+    decoder_start_token_id: int
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        # input features and labels; they have to be of different lengths and need different padding
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        # get the tokenized Label sequences
+        label_features = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # if bos token is appended in previous tokenization step, cut it
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+    processor=processor, decoder_start_token_id=model.config.decoder_start_token_id
+)
+
+
+# ==========================================
+# 4) Metrics: WER
+# ==========================================
+import evaluate
+metric = evaluate.load("wer")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    # replace -100 with the pad token id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    # don't group tokens when computing the metrics
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+
+# ==========================================
+# 5) Training configurations
+# ==========================================
+from transformers import Seq2SeqTrainingArguments
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,   # increase by 2x for every 2x decrease in batch size
+    learning_rate=1e-5,
     warmup_steps=500,
-    num_train_epochs=3,
+    max_steps=1000,
+    gradient_checkpointing=True,
     fp16=True,
-    logging_steps=50,
     evaluation_strategy="steps",
-    eval_steps=500,
-    save_steps=500,
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    seed=91,
+    logging_steps=5,
+    eval_steps=5,
+    save_strategy="steps",
     save_total_limit=2,
-    predict_with_generate=False,
-    report_to="none",
-    gradient_checkpointing=True
+    report_to=["none"],
+    load_best_model_at_end=True,  # THIS IS IMPORTANT
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    push_to_hub=False,
+    dataloader_num_workers=8,
+    dataloader_prefetch_factor=2,
 )
 
-# NEW: build trainer
-trainer = Seq2SeqTrainer(                              # <--- NEW
+# CHANGE: avoid saving optimizer/scheduler into checkpoints to fix zip write error
+try:
+    training_args.save_only_model = True
+except Exception:
+    pass
+
+# For HF versions without `save_only_model`, monkey-patch the Trainer hook
+try:
+    import transformers
+    if not getattr(training_args, "save_only_model", False):
+        from transformers.trainer import Trainer as _BaseTrainer
+        def _no_save_optimizer_and_scheduler(self, output_dir):
+            return
+        _BaseTrainer._save_optimizer_and_scheduler = _no_save_optimizer_and_scheduler
+except Exception as _e:
+    print("Non-fatal: could not patch optimizer/scheduler saving:", _e)
+
+
+# ==========================================
+# 6) Trainer & training
+# ==========================================
+from transformers import Seq2SeqTrainer
+
+trainer = Seq2SeqTrainer(
     args=training_args,
-    model=model,
-    train_dataset=train_ds.remove_columns(["audio", "sentence"]),
-    eval_dataset=eval_ds.remove_columns(["audio", "sentence"]),
-    tokenizer=processor.tokenizer,
-    data_collator=data_collator
+    model=model,  # <- PEFT-wrapped model
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor,
 )
 
-# NEW: kick off training
-# (comment this out if you only wanted the config objects)
-trainer.train()                                        # <--- NEW
+trainer.train()
 
-# ================================================================================
+# (Optional) final save:
+# For LoRA, save just the adapter (recommended)
+# adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # <<< NEW CHANGE
+# trainer.model.save_pretrained(adapter_dir)
+
+
+# ==========================================
+# 7) Evaluate saved model on test set and export CSV
+# ==========================================
+import numpy as np
+import pandas as pd
+from transformers import WhisperForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+# If you saved the adapter as above, set these:
+SAVED_BASE_DIR = whisper_loc
+SAVED_ADAPTER_DIR = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # <<< NEW CHANGE
+CSV_OUT = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/test_predictions_v1_Shob.csv"
+
+# 1) Reload base model then attach LoRA adapter  <<< NEW CHANGE
+base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
+from peft import PeftModel  # <<< NEW CHANGE
+eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)  # <<< NEW CHANGE
+
+# 2) Rebuild a lightweight eval-only trainer (no training)
+eval_args = Seq2SeqTrainingArguments(
+    output_dir="./test_eval_out",
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    fp16=True,
+    report_to=["none"],
+)
+
+eval_trainer = Seq2SeqTrainer(
+    args=eval_args,
+    model=eval_model,
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    tokenizer=processor,
+    compute_metrics=compute_metrics,
+)
+
+# 3) Overall test metrics
+test_metrics = eval_trainer.evaluate()
+print("Test metrics:", {k: float(v) for k, v in test_metrics.items()})  # includes 'eval_wer'
+
+# 4) Per-sample predictions
+pred = eval_trainer.predict(vectorized_datasets["test"])
+pred_ids = pred.predictions
+label_ids = pred.label_ids
+
+# 5) Decode predictions/labels
+label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+# 6) Per-utterance WER and CSV
+import evaluate
+wer_metric = evaluate.load("wer")
+rows = []
+test_raw = raw_datasets["test"]  # has 'audio' + 'sentence'
+
+for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
+    w = 100 * wer_metric.compute(predictions=[hyp], references=[ref])
+    rows.append({
+        "idx": i,
+        "audio": test_raw[i]["audio"]["path"],
+        "reference": ref,
+        "prediction": hyp,
+        "wer": round(w, 2),
+    })
+
+df = pd.DataFrame(rows)
+df.to_csv(CSV_OUT, index=False, encoding="utf-8")
+print("Saved detailed predictions to:", CSV_OUT)
