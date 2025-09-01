@@ -132,12 +132,22 @@ lora_cfg = LoraConfig(
 )
 model = get_peft_model(model, lora_cfg)
 
-# NEW CHANGE: safety—drop any stray text-style kwargs (e.g., input_ids) before Whisper forward
-_model_forward_orig = model.forward
-def _forward_strip_input_ids(*args, **kwargs):
+# NEW CHANGE: patch BOTH forward paths so Whisper never receives text-style kwargs
+# (PEFT 0.17.x calls `self.model_forward(**kwargs)`, not `self.forward`.)
+if hasattr(model, "model_forward"):
+    _orig_model_forward = model.model_forward
+    def _model_forward_strip(*args, **kwargs):
+        kwargs.pop("input_ids", None)
+        kwargs.pop("attention_mask", None)
+        return _orig_model_forward(*args, **kwargs)
+    model.model_forward = _model_forward_strip
+
+_orig_forward = model.forward
+def _forward_strip(*args, **kwargs):
     kwargs.pop("input_ids", None)
-    return _model_forward_orig(*args, **kwargs)
-model.forward = _forward_strip_input_ids
+    kwargs.pop("attention_mask", None)
+    return _orig_forward(*args, **kwargs)
+model.forward = _forward_strip
 # ------------------------------------------------------------------------------------------
 
 @dataclass
@@ -218,6 +228,7 @@ training_args = Seq2SeqTrainingArguments(
     push_to_hub=False,
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
+    remove_unused_columns=False,   # NEW CHANGE: safer for audio models
 )
 
 # CHANGE: avoid saving optimizer/scheduler into checkpoints to fix zip write error
@@ -257,8 +268,8 @@ trainer.train()
 
 # (Optional) final save:
 # For LoRA, save just the adapter (recommended for small checkpoints)
-adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # NEW CHANGE
-trainer.model.save_pretrained(adapter_dir)  # NEW CHANGE
+adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
+trainer.model.save_pretrained(adapter_dir)
 
 
 # ==========================================
@@ -277,12 +288,21 @@ from peft import PeftModel
 base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
 eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
 
-# NEW CHANGE: same safety wrapper for eval
-_eval_forward_orig = eval_model.forward
-def _eval_forward_strip_input_ids(*args, **kwargs):
+# NEW CHANGE: patch BOTH forward paths on eval model as well
+if hasattr(eval_model, "model_forward"):
+    _orig_eval_model_forward = eval_model.model_forward
+    def _eval_model_forward_strip(*args, **kwargs):
+        kwargs.pop("input_ids", None)
+        kwargs.pop("attention_mask", None)
+        return _orig_eval_model_forward(*args, **kwargs)
+    eval_model.model_forward = _eval_model_forward_strip
+
+_orig_eval_forward = eval_model.forward
+def _eval_forward_strip(*args, **kwargs):
     kwargs.pop("input_ids", None)
-    return _eval_forward_orig(*args, **kwargs)
-eval_model.forward = _eval_forward_strip_input_ids
+    kwargs.pop("attention_mask", None)
+    return _orig_eval_forward(*args, **kwargs)
+eval_model.forward = _eval_forward_strip
 
 # 2) Rebuild a lightweight eval-only trainer (no training)
 eval_args = Seq2SeqTrainingArguments(
@@ -292,6 +312,7 @@ eval_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     fp16=True,
     report_to=["none"],
+    remove_unused_columns=False,   # NEW CHANGE: mirror training
 )
 
 eval_trainer = Seq2SeqTrainer(
