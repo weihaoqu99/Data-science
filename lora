@@ -36,9 +36,8 @@ raw_datasets
 # =========================
 
 
-# >>> NEW CHANGE (ACCELERATE PATCH): add a compatibility shim so importing `transformers` doesn't fail
-# Some transformers versions import `clear_device_cache` from accelerate.utils.memory, which may not exist
-# in older `accelerate`. This defines it if missing.
+# (kept from previous message) — accelerate compatibility shim
+# >>> NEW CHANGE (ACCELERATE PATCH): define clear_device_cache if missing
 try:
     from accelerate.utils import memory as _acc_mem
     if not hasattr(_acc_mem, "clear_device_cache"):
@@ -49,7 +48,6 @@ try:
                     torch.cuda.empty_cache()
                     torch.cuda.ipc_collect()
             except Exception:
-                # safest no-op fallback
                 pass
         _acc_mem.clear_device_cache = clear_device_cache
 except Exception as _patch_err:
@@ -57,7 +55,7 @@ except Exception as _patch_err:
 # <<< NEW CHANGE (ACCELERATE PATCH)
 
 
-# >>> NEW CHANGE (LoRA): Whisper + vectorization + LoRA config (use_rslora=True, r=64, alpha=32) + training
+# ========== Whisper + LoRA pipeline ==========
 import torch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
@@ -74,7 +72,6 @@ whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
 processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
 
 model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-# Required flags
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
 model.config.use_cache = False
@@ -97,19 +94,53 @@ vectorized_datasets = raw_datasets.map(
     num_proc=8
 )
 
+# >>> NEW CHANGE (FIX KeyError 'input_features'):
+# Some audio files may fail to decode, leaving examples without 'input_features'.
+# We drop any bad rows and normalize dtypes so the collator never hits KeyError.
+def _has_input_features(example):
+    return (
+        example is not None
+        and "input_features" in example
+        and example["input_features"] is not None
+    )
+
+for split in ["train", "test"]:
+    vectorized_datasets[split] = vectorized_datasets[split].filter(_has_input_features)
+
+# (Optional) quick sanity check — uncomment to see remaining counts
+# print(vectorized_datasets)
+# <<< NEW CHANGE (FIX KeyError 'input_features')
+
+
 # 3) Data collator (pads inputs & labels separately)
+import numpy as np
+
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     decoder_start_token_id: int
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": f["input_features"]} for f in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-        label_features = [{"input_ids": f["labels"]} for f in features]
+        input_list = []
+        for f in features:
+            x = f.get("input_features", None)
+            # >>> NEW CHANGE (FIX KeyError 'input_features'): robustify dtype to list/np.ndarray
+            if isinstance(x, np.ndarray):
+                x = x.tolist()
+            if x is None:
+                # if a bad sample slipped through for any reason, skip it gracefully
+                continue
+            input_list.append({"input_features": x})
+            # <<< NEW CHANGE (FIX KeyError 'input_features')
+
+        batch = self.processor.feature_extractor.pad(input_list, return_tensors="pt")
+
+        label_features = [{"input_ids": f["labels"]} for f in features if "labels" in f]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+
+        if labels.size(0) > 0 and (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
+
         batch["labels"] = labels
         return batch
 
@@ -121,15 +152,15 @@ data_collator = DataCollatorSpeechSeq2SeqWithPadding(
 # 4) LoRA configuration (use_rslora=True, r=64, alpha=32)
 from peft import LoraConfig, get_peft_model
 
-lora_targets = ["q_proj", "v_proj"]  # common and efficient for Whisper attention
+lora_targets = ["q_proj", "v_proj"]  # efficient targets for Whisper attention
 peft_cfg = LoraConfig(
-    r=64,                  # rank
-    lora_alpha=32,         # alpha
+    r=64,
+    lora_alpha=32,
     lora_dropout=0.05,
     bias="none",
     target_modules=lora_targets,
     task_type="SEQ_2_SEQ_LM",
-    use_rslora=True        # Rs LoRA = True
+    use_rslora=True
 )
 
 model = get_peft_model(model, peft_cfg)
@@ -153,7 +184,7 @@ def compute_metrics(pred):
     wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
-# 6) Training args (keep your preferred values; these mirror the earlier example)
+# 6) Training args (unchanged from earlier example)
 training_args = Seq2SeqTrainingArguments(
     output_dir="./whisper_lora_out",
     per_device_train_batch_size=4,
@@ -208,13 +239,12 @@ trainer = Seq2SeqTrainer(
 
 trainer.train()
 
-# 8) Save the LoRA adapter (small footprint) + processor
+# 8) Save adapter + processor
 adapter_dir = "./whisper_lora_out/adapter"
 trainer.model.save_pretrained(adapter_dir)
 processor.save_pretrained(adapter_dir)
 
-# (Optional) Merge LoRA back to base weights for export:
+# (Optional) Merge LoRA back to base weights:
 # from peft import merge_and_unload
 # merged = merge_and_unload(model)
 # merged.save_pretrained("./whisper_lora_out/merged_model")
-# <<< NEW CHANGE (LoRA)
