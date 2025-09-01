@@ -36,11 +36,28 @@ raw_datasets
 # =========================
 
 
+# >>> NEW CHANGE (ACCELERATE PATCH): add a compatibility shim so importing `transformers` doesn't fail
+# Some transformers versions import `clear_device_cache` from accelerate.utils.memory, which may not exist
+# in older `accelerate`. This defines it if missing.
+try:
+    from accelerate.utils import memory as _acc_mem
+    if not hasattr(_acc_mem, "clear_device_cache"):
+        def clear_device_cache():
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.ipc_collect()
+            except Exception:
+                # safest no-op fallback
+                pass
+        _acc_mem.clear_device_cache = clear_device_cache
+except Exception as _patch_err:
+    print("Non-fatal: could not patch accelerate.clear_device_cache:", _patch_err)
+# <<< NEW CHANGE (ACCELERATE PATCH)
 
-# >>> NEW CHANGE (LoRA): Add Whisper model, processor, dataset vectorization, LoRA config (use_rslora=True, r=64, alpha=32), and training
-# If peft isn't installed, uncomment the next two lines once:
-# import sys, subprocess; subprocess.check_call([sys.executable, "-m", "pip", "install", "peft>=0.11.0"])
 
+# >>> NEW CHANGE (LoRA): Whisper + vectorization + LoRA config (use_rslora=True, r=64, alpha=32) + training
 import torch
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
@@ -57,7 +74,7 @@ whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
 processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
 
 model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-# Required for gradient checkpointing with seq2seq
+# Required flags
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
 model.config.use_cache = False
@@ -104,18 +121,15 @@ data_collator = DataCollatorSpeechSeq2SeqWithPadding(
 # 4) LoRA configuration (use_rslora=True, r=64, alpha=32)
 from peft import LoraConfig, get_peft_model
 
-# Whisper attention modules commonly targeted for LoRA:
-# keep it lean/effective by adapting query/value projections
-lora_targets = ["q_proj", "v_proj"]
-
+lora_targets = ["q_proj", "v_proj"]  # common and efficient for Whisper attention
 peft_cfg = LoraConfig(
-    r=64,                      # rank
-    lora_alpha=32,             # alpha
-    lora_dropout=0.05,         # safe default; change if you need
+    r=64,                  # rank
+    lora_alpha=32,         # alpha
+    lora_dropout=0.05,
     bias="none",
     target_modules=lora_targets,
     task_type="SEQ_2_SEQ_LM",
-    use_rslora=True            # << Rs LoRA = True
+    use_rslora=True        # Rs LoRA = True
 )
 
 model = get_peft_model(model, peft_cfg)
@@ -127,7 +141,7 @@ def print_trainable_parameters(m):
     print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.2f}%)")
 print_trainable_parameters(model)
 
-# 5) Simple metric (WER)
+# 5) Metric (WER)
 import evaluate
 wer_metric = evaluate.load("wer")
 def compute_metrics(pred):
@@ -139,7 +153,7 @@ def compute_metrics(pred):
     wer = 100 * wer_metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
-# 6) Training args (minimal example; keep your preferred values)
+# 6) Training args (keep your preferred values; these mirror the earlier example)
 training_args = Seq2SeqTrainingArguments(
     output_dir="./whisper_lora_out",
     per_device_train_batch_size=4,
@@ -167,8 +181,7 @@ training_args = Seq2SeqTrainingArguments(
     dataloader_prefetch_factor=2,
 )
 
-# (Safety) Skip optimizer/scheduler saving to avoid zip write errors on some FS
-# You can remove this block if your environment is stable.
+# (Safety) Avoid optimizer/scheduler saving to bypass zip write errors on some filesystems
 try:
     training_args.save_only_model = True
 except Exception:
@@ -182,7 +195,7 @@ try:
 except Exception as _e:
     print("Non-fatal: checkpoint patch failed:", _e)
 
-# 7) Trainer
+# 7) Trainer & Train
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
@@ -193,16 +206,15 @@ trainer = Seq2SeqTrainer(
     tokenizer=processor,
 )
 
-# 8) Train
 trainer.train()
 
-# 9) Save final adapter (small!) and, if you want, the merged model
+# 8) Save the LoRA adapter (small footprint) + processor
 adapter_dir = "./whisper_lora_out/adapter"
 trainer.model.save_pretrained(adapter_dir)
 processor.save_pretrained(adapter_dir)
 
-# (Optional) Merge LoRA into base weights for export (creates a full model checkpoint)
+# (Optional) Merge LoRA back to base weights for export:
 # from peft import merge_and_unload
-# merged = merge_and_unload(model)  # returns a plain HuggingFace model with LoRA merged
+# merged = merge_and_unload(model)
 # merged.save_pretrained("./whisper_lora_out/merged_model")
 # <<< NEW CHANGE (LoRA)
