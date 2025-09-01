@@ -1,3 +1,133 @@
+import os
+import glob
+import torch
+from datasets import Dataset, Audio
+
+from transformers import (
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
+)
+
+from peft import LoraConfig, get_peft_model, TaskType
+
+# ------------------------------
+# Environment setup
+# ------------------------------
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+# ------------------------------
+# Data preparation
+# ------------------------------
+audio_files = glob.glob("/appdata/cortex/dev1/origAudio/*.mp3")
+
+def retrieve_transcript(input_str: str) -> str:
+    tmp = input_str[input_str.find("-")+1:-4]
+    tmp = tmp.replace("_", " ").replace(".", " ")
+    tmp = tmp.replace("shell", "she'll").replace("dont", "don't")
+    tmp = tmp.capitalize()
+    tmp = tmp.replace(" i ", " I ")
+    return tmp
+
+transcripts = [retrieve_transcript(s) for s in audio_files]
+
+raw_datasets = Dataset.from_dict({
+    "audio": audio_files,
+    "sentence": transcripts,
+}).cast_column("audio", Audio(sampling_rate=16_000))
+
+raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
+
+# ------------------------------
+# Whisper processor & tokenizer
+# ------------------------------
+processor = WhisperProcessor.from_pretrained("openai/whisper-small")
+
+def preprocess_function(batch):
+    # Load & preprocess audio
+    audio = batch["audio"]
+
+    inputs = processor(
+        audio["array"], sampling_rate=16000, return_tensors="pt"
+    )
+
+    # Tokenize transcript → labels
+    with processor.as_target_processor():
+        labels = processor(batch["sentence"]).input_ids
+
+    return {
+        "input_features": inputs.input_features[0],
+        "labels": labels,
+    }
+
+processed_datasets = raw_datasets.map(preprocess_function)
+
+# ------------------------------
+# Load Whisper base model
+# ------------------------------
+model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-small")
+
+# ------------------------------
+# Apply LoRA
+# ------------------------------
+lora_config = LoraConfig(
+    r=64,
+    lora_alpha=32,
+    target_modules=["q_proj", "v_proj"],  # critical for Whisper
+    lora_dropout=0.1,
+    bias="none",
+    task_type=TaskType.SEQ_2_SEQ_LM,
+)
+
+model = get_peft_model(model, lora_config)
+
+# Ensure trainable params
+model.print_trainable_parameters()
+
+# Enable gradient checkpointing safely
+if hasattr(model, "gradient_checkpointing_enable"):
+    model.gradient_checkpointing_enable()
+
+# ------------------------------
+# Training arguments
+# ------------------------------
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./whisper-lora-finetuned",
+    per_device_train_batch_size=4,
+    per_device_eval_batch_size=4,
+    learning_rate=1e-4,
+    num_train_epochs=3,
+    evaluation_strategy="steps",
+    save_strategy="steps",
+    save_steps=500,
+    eval_steps=500,
+    logging_steps=50,
+    predict_with_generate=True,
+    fp16=True,
+    gradient_checkpointing=True,
+    report_to="none",  # disable HF reporting
+)
+
+# ------------------------------
+# Trainer setup
+# ------------------------------
+trainer = Seq2SeqTrainer(
+    model=model,
+    args=training_args,
+    train_dataset=processed_datasets["train"],
+    eval_dataset=processed_datasets["test"],
+    tokenizer=processor.feature_extractor,
+)
+
+# ------------------------------
+# Train
+# ------------------------------
+trainer.train()
+
+
+
+
 # ==========================================
 # 0) NEW CHANGE (FIX): accelerate shim for PEFT import
 # ==========================================
