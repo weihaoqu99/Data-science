@@ -113,7 +113,7 @@ model.config.use_cache = False  # incompatible with gradient checkpointing (memo
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# ---------- NEW CHANGE: LoRA (rank=64, alpha=32) ----------
+# ---------- NEW CHANGE: LoRA (enable=True, rank=64, alpha=32) ----------
 from peft import LoraConfig, get_peft_model
 try:
     from peft import TaskType
@@ -129,34 +129,25 @@ lora_cfg = LoraConfig(
     task_type=_task_type,
     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # attention projections
 )
-model = get_peft_model(model, lora_cfg)
 
-# ---------- NEW CHANGE: Override PEFT call paths to be Whisper-safe ----------
-import contextlib
-def _whisper_safe_call(self, *args, **kwargs):
-    # ignore text-style args PEFT may try to push
-    kwargs.pop("input_ids", None)
-    kwargs.pop("attention_mask", None)
-    # keep only keys Whisper understands (tolerant to extras, but we filter anyway)
-    allow = {"input_features", "labels", "decoder_input_ids", "decoder_attention_mask",
-             "return_dict", "output_attentions", "output_hidden_states", "use_cache"}
-    kwargs = {k: v for k, v in kwargs.items() if k in allow or k.startswith("encoder_")}
-    ctx_mgr = getattr(self, "_enable_peft_forward_hooks", None)
-    if callable(ctx_mgr):
-        with ctx_mgr(**kwargs):
-            return self.base_model(**kwargs)
-    return self.base_model(**kwargs)
+peft_model = get_peft_model(model, lora_cfg)  # keep as separate var for clarity
 
-# Patch BOTH entry points used by PEFT 0.17.x
-try:
-    model.model_forward = _whisper_safe_call.__get__(model, type(model))  # bound method
-except Exception:
-    pass
-try:
-    model.forward = _whisper_safe_call.__get__(model, type(model))        # bound method
-except Exception:
-    pass
-# --------------------------------------------------------------------------
+# ---------- NEW CHANGE: tiny training wrapper to GUARANTEE grads on LoRA ----------
+# We avoid PEFT's text-centric forward path entirely during training by
+# calling the Whisper base model (which already contains LoRA-injected layers).
+class WhisperLoRAForTraining(torch.nn.Module):
+    def __init__(self, peft_model):
+        super().__init__()
+        self.peft = peft_model  # child module -> its parameters are trainable
+        self.base = peft_model.base_model
+
+    def forward(self, input_features=None, labels=None, **kwargs):
+        # pass only what Whisper expects; everything else ignored
+        return self.base(input_features=input_features, labels=labels, return_dict=True)
+
+# This is the model we hand to Trainer for training.
+train_model = WhisperLoRAForTraining(peft_model)
+# ----------------------------------------------------------------------------------
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -222,7 +213,7 @@ training_args = Seq2SeqTrainingArguments(
     fp16=True,
     evaluation_strategy="steps",
     per_device_eval_batch_size=4,
-    predict_with_generate=True,
+    predict_with_generate=False,   # NEW CHANGE: avoid generation inside training loop
     generation_max_length=225,
     seed=91,
     logging_steps=5,
@@ -236,7 +227,7 @@ training_args = Seq2SeqTrainingArguments(
     push_to_hub=False,
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
-    remove_unused_columns=False,   # NEW CHANGE: safer for audio models
+    remove_unused_columns=False,   # safer for audio models
 )
 
 # CHANGE: avoid saving optimizer/scheduler into checkpoints to fix zip write error
@@ -264,20 +255,19 @@ from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
-    model=model,  # PEFT-wrapped model with Whisper-safe forward
+    model=train_model,  # NEW CHANGE: wrapper that guarantees gradient flow to LoRA
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
-    compute_metrics=compute_metrics,
+    compute_metrics=None,        # NEW CHANGE: no gen during training; compute after
     tokenizer=processor,
 )
 
 trainer.train()
 
-# (Optional) final save:
-# For LoRA, save just the adapter (smallest checkpoint)
+# (Optional) final save: save just the adapter (small checkpoint)
 adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
-trainer.model.save_pretrained(adapter_dir)
+peft_model.save_pretrained(adapter_dir)  # save the real PEFT model’s adapter
 
 
 # ==========================================
@@ -296,27 +286,26 @@ from peft import PeftModel
 base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
 eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
 
-# --- apply the same Whisper-safe call patch on eval model ---
-try:
-    eval_model.model_forward = _whisper_safe_call.__get__(eval_model, type(eval_model))
-except Exception:
-    pass
-try:
-    eval_model.forward = _whisper_safe_call.__get__(eval_model, type(eval_model))
-except Exception:
-    pass
+# (Optional safety) Whisper doesn’t need/accept text inputs; Trainer won't pass any now,
+# but if your environment still injects them, you can keep the two-line guard:
+_orig_fwd = eval_model.forward
+def _strip_texty(*a, **kw):
+    kw.pop("input_ids", None); kw.pop("attention_mask", None)
+    return _orig_fwd(*a, **kw)
+eval_model.forward = _strip_texty
 
-# 2) Rebuild a lightweight eval-only trainer (no training)
+# 2) Rebuild a lightweight eval-only trainer WITH generation
 eval_args = Seq2SeqTrainingArguments(
     output_dir="./test_eval_out",
     per_device_eval_batch_size=4,
-    predict_with_generate=True,
+    predict_with_generate=True,     # generate during eval now
     generation_max_length=225,
     fp16=True,
     report_to=["none"],
-    remove_unused_columns=False,   # mirror training
+    remove_unused_columns=False,
 )
 
+# Use metrics again for eval only
 eval_trainer = Seq2SeqTrainer(
     args=eval_args,
     model=eval_model,
@@ -356,6 +345,7 @@ for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
         "wer": round(w, 2),
     })
 
+import pandas as pd
 df = pd.DataFrame(rows)
 df.to_csv(CSV_OUT, index=False, encoding="utf-8")
 print("Saved detailed predictions to:", CSV_OUT)
