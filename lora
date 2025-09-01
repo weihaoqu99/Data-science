@@ -1,4 +1,105 @@
 # ==========================================
+# 0) NEW CHANGE (FIX): accelerate shim for PEFT import
+# Place this at the very top so PEFT can import even if accelerate lacks utils.memory
+# ==========================================
+import sys, types, gc
+try:
+    from accelerate.utils.memory import clear_device_cache as _ok_clear  # noqa: F401
+except Exception:
+    try:
+        import torch as _torch
+        if "accelerate.utils" not in sys.modules:
+            sys.modules["accelerate.utils"] = types.ModuleType("accelerate.utils")
+        mem_mod = types.ModuleType("accelerate.utils.memory")
+        def clear_device_cache():
+            try:
+                _torch.cuda.empty_cache()
+                if hasattr(_torch.cuda, "reset_peak_memory_stats"):
+                    _torch.cuda.reset_peak_memory_stats()
+                if hasattr(_torch.cuda, "ipc_collect"):
+                    _torch.cuda.ipc_collect()
+            except Exception:
+                pass
+            gc.collect()
+        mem_mod.clear_device_cache = clear_device_cache
+        sys.modules["accelerate.utils.memory"] = mem_mod
+    except Exception:
+        mem_mod = types.ModuleType("accelerate.utils.memory")
+        def clear_device_cache():
+            gc.collect()
+        mem_mod.clear_device_cache = clear_device_cache
+        sys.modules.setdefault("accelerate.utils", types.ModuleType("accelerate.utils"))
+        sys.modules["accelerate.utils.memory"] = mem_mod
+
+
+# ==========================================
+# 1) Imports & audio listing
+# ==========================================
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+
+from datasets import Dataset, Audio
+import glob
+
+audio_files = glob.glob("/appdata/cortex/dev1/origAudio/*.mp3")
+
+def retrieve_transcript(input_str: str) -> str:
+    tmp = input_str[input_str.find("-")+1:-4]  # strip out track number and .mp3 suffix
+    tmp = tmp.replace('_', ' ')
+    tmp = tmp.replace('.', ' ')
+    tmp = tmp.replace("shell", "she'll")
+    tmp = tmp.replace("dont", "don't")
+    tmp = tmp.capitalize()
+    tmp = tmp.replace(' i ', ' I ')
+    return tmp
+
+transcripts = [retrieve_transcript(s) for s in audio_files]
+
+# Need to adjust sampling rate if necessary
+num_samples = len(audio_files)
+
+raw_datasets = Dataset.from_dict({
+    "audio": audio_files[:num_samples],
+    "sentence": transcripts[:num_samples]
+}).cast_column("audio", Audio(sampling_rate=16_000))
+
+raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
+raw_datasets
+
+
+# ==========================================
+# 2) Whisper processor & dataset vectorization
+# ==========================================
+from transformers import WhisperProcessor
+
+# use your local copy (from screenshot)
+whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
+processor = WhisperProcessor.from_pretrained(
+    whisper_loc, language="English", task="transcribe"
+)
+
+def prepare_dataset(batch):
+    # Load and (possibly) resample audio to 16kHz
+    audio = batch["audio"]
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+
+    # optional pre-processing
+    transcription = batch["sentence"]
+
+    # encode target text to label ids
+    batch["labels"] = processor.tokenizer(transcription).input_ids
+    return batch
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets["train"].column_names,
+    num_proc=8
+)
+
+
+# ==========================================
 # 3) Model config and custom data collator
 # ==========================================
 from transformers import WhisperForConditionalGeneration
@@ -13,8 +114,7 @@ model.config.use_cache = False  # incompatible with gradient checkpointing (memo
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# ---------- NEW CHANGE (LoRA fix): speech-aware task type + safe forward patch ----------
-# The TaskType guard uses SPEECH_SEQ_2_SEQ if your PEFT has it; otherwise falls back.
+# ---------- NEW CHANGE: LoRA (enable=True, rank=64, alpha=32) + Whisper-safe task ----------
 from peft import LoraConfig, get_peft_model
 try:
     from peft import TaskType
@@ -30,17 +130,15 @@ lora_cfg = LoraConfig(
     task_type=_task_type,
     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # attention projections
 )
-
 model = get_peft_model(model, lora_cfg)
 
-# SAFETY: Some PEFT/Trainer combos may still pass `input_ids`.
-# Strip it if present so Whisper receives only `input_features` + `labels`.
+# NEW CHANGE: safety—drop any stray text-style kwargs (e.g., input_ids) before Whisper forward
 _model_forward_orig = model.forward
 def _forward_strip_input_ids(*args, **kwargs):
     kwargs.pop("input_ids", None)
     return _model_forward_orig(*args, **kwargs)
 model.forward = _forward_strip_input_ids
-# ------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -63,3 +161,178 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         batch["labels"] = labels
         return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+    processor=processor, decoder_start_token_id=model.config.decoder_start_token_id
+)
+
+
+# ==========================================
+# 4) Metrics: WER
+# ==========================================
+import evaluate
+metric = evaluate.load("wer")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+
+    # replace -100 with the pad token id
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    # don't group tokens when computing the metrics
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+
+# ==========================================
+# 5) Training configurations
+# ==========================================
+from transformers import Seq2SeqTrainingArguments
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,   # increase by 2x for every 2x decrease in batch size
+    learning_rate=1e-5,
+    warmup_steps=500,
+    max_steps=1000,
+    gradient_checkpointing=True,
+    fp16=True,
+    evaluation_strategy="steps",
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    seed=91,
+    logging_steps=5,
+    eval_steps=5,
+    save_strategy="steps",
+    save_total_limit=2,
+    report_to=["none"],
+    load_best_model_at_end=True,  # THIS IS IMPORTANT
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    push_to_hub=False,
+    dataloader_num_workers=8,
+    dataloader_prefetch_factor=2,
+)
+
+# CHANGE: avoid saving optimizer/scheduler into checkpoints to fix zip write error
+try:
+    training_args.save_only_model = True
+except Exception:
+    pass
+
+# For HF versions without `save_only_model`, monkey-patch the Trainer hook
+try:
+    import transformers
+    if not getattr(training_args, "save_only_model", False):
+        from transformers.trainer import Trainer as _BaseTrainer
+        def _no_save_optimizer_and_scheduler(self, output_dir):
+            return
+        _BaseTrainer._save_optimizer_and_scheduler = _no_save_optimizer_and_scheduler
+except Exception as _e:
+    print("Non-fatal: could not patch optimizer/scheduler saving:", _e)
+
+
+# ==========================================
+# 6) Trainer & training
+# ==========================================
+from transformers import Seq2SeqTrainer
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,  # PEFT-wrapped model
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    compute_metrics=compute_metrics,
+    tokenizer=processor,
+)
+
+trainer.train()
+
+# (Optional) final save:
+# For LoRA, save just the adapter (recommended for small checkpoints)
+adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"  # NEW CHANGE
+trainer.model.save_pretrained(adapter_dir)  # NEW CHANGE
+
+
+# ==========================================
+# 7) Evaluate saved model on test set and export CSV
+# ==========================================
+import numpy as np
+import pandas as pd
+from transformers import WhisperForConditionalGeneration, Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+SAVED_BASE_DIR = whisper_loc
+SAVED_ADAPTER_DIR = adapter_dir
+CSV_OUT = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/test_predictions_v1_Shob.csv"
+
+# 1) Reload base model then attach LoRA adapter
+from peft import PeftModel
+base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
+eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
+
+# NEW CHANGE: same safety wrapper for eval
+_eval_forward_orig = eval_model.forward
+def _eval_forward_strip_input_ids(*args, **kwargs):
+    kwargs.pop("input_ids", None)
+    return _eval_forward_orig(*args, **kwargs)
+eval_model.forward = _eval_forward_strip_input_ids
+
+# 2) Rebuild a lightweight eval-only trainer (no training)
+eval_args = Seq2SeqTrainingArguments(
+    output_dir="./test_eval_out",
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    fp16=True,
+    report_to=["none"],
+)
+
+eval_trainer = Seq2SeqTrainer(
+    args=eval_args,
+    model=eval_model,
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    tokenizer=processor,
+    compute_metrics=compute_metrics,
+)
+
+# 3) Overall test metrics
+test_metrics = eval_trainer.evaluate()
+print("Test metrics:", {k: float(v) for k, v in test_metrics.items()})  # includes 'eval_wer'
+
+# 4) Per-sample predictions
+pred = eval_trainer.predict(vectorized_datasets["test"])
+pred_ids = pred.predictions
+label_ids = pred.label_ids
+
+# 5) Decode predictions/labels
+label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+# 6) Per-utterance WER and CSV
+import evaluate
+wer_metric = evaluate.load("wer")
+rows = []
+test_raw = raw_datasets["test"]  # has 'audio' + 'sentence'
+
+for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
+    w = 100 * wer_metric.compute(predictions=[hyp], references=[ref])
+    rows.append({
+        "idx": i,
+        "audio": test_raw[i]["audio"]["path"],
+        "reference": ref,
+        "prediction": hyp,
+        "wer": round(w, 2),
+    })
+
+df = pd.DataFrame(rows)
+df.to_csv(CSV_OUT, index=False, encoding="utf-8")
+print("Saved detailed predictions to:", CSV_OUT)
