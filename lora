@@ -1,6 +1,5 @@
 # ==========================================
 # 0) NEW CHANGE (FIX): accelerate shim for PEFT import
-# Place this at the very top so PEFT can import even if accelerate lacks utils.memory
 # ==========================================
 import sys, types, gc
 try:
@@ -114,13 +113,13 @@ model.config.use_cache = False  # incompatible with gradient checkpointing (memo
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# ---------- NEW CHANGE: LoRA (enable=True, rank=64, alpha=32) + Whisper-safe task ----------
+# ---------- NEW CHANGE: LoRA (rank=64, alpha=32) ----------
 from peft import LoraConfig, get_peft_model
 try:
     from peft import TaskType
     _task_type = getattr(TaskType, "SPEECH_SEQ_2_SEQ", TaskType.SEQ_2_SEQ_LM)
 except Exception:
-    _task_type = "SEQ_2_SEQ_LM"  # very old PEFT fallback
+    _task_type = "SEQ_2_SEQ_LM"
 
 lora_cfg = LoraConfig(
     r=64,
@@ -132,23 +131,32 @@ lora_cfg = LoraConfig(
 )
 model = get_peft_model(model, lora_cfg)
 
-# NEW CHANGE: patch BOTH forward paths so Whisper never receives text-style kwargs
-# (PEFT 0.17.x calls `self.model_forward(**kwargs)`, not `self.forward`.)
-if hasattr(model, "model_forward"):
-    _orig_model_forward = model.model_forward
-    def _model_forward_strip(*args, **kwargs):
-        kwargs.pop("input_ids", None)
-        kwargs.pop("attention_mask", None)
-        return _orig_model_forward(*args, **kwargs)
-    model.model_forward = _model_forward_strip
-
-_orig_forward = model.forward
-def _forward_strip(*args, **kwargs):
+# ---------- NEW CHANGE: Override PEFT call paths to be Whisper-safe ----------
+import contextlib
+def _whisper_safe_call(self, *args, **kwargs):
+    # ignore text-style args PEFT may try to push
     kwargs.pop("input_ids", None)
     kwargs.pop("attention_mask", None)
-    return _orig_forward(*args, **kwargs)
-model.forward = _forward_strip
-# ------------------------------------------------------------------------------------------
+    # keep only keys Whisper understands (tolerant to extras, but we filter anyway)
+    allow = {"input_features", "labels", "decoder_input_ids", "decoder_attention_mask",
+             "return_dict", "output_attentions", "output_hidden_states", "use_cache"}
+    kwargs = {k: v for k, v in kwargs.items() if k in allow or k.startswith("encoder_")}
+    ctx_mgr = getattr(self, "_enable_peft_forward_hooks", None)
+    if callable(ctx_mgr):
+        with ctx_mgr(**kwargs):
+            return self.base_model(**kwargs)
+    return self.base_model(**kwargs)
+
+# Patch BOTH entry points used by PEFT 0.17.x
+try:
+    model.model_forward = _whisper_safe_call.__get__(model, type(model))  # bound method
+except Exception:
+    pass
+try:
+    model.forward = _whisper_safe_call.__get__(model, type(model))        # bound method
+except Exception:
+    pass
+# --------------------------------------------------------------------------
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
@@ -256,7 +264,7 @@ from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
-    model=model,  # PEFT-wrapped model
+    model=model,  # PEFT-wrapped model with Whisper-safe forward
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
@@ -267,7 +275,7 @@ trainer = Seq2SeqTrainer(
 trainer.train()
 
 # (Optional) final save:
-# For LoRA, save just the adapter (recommended for small checkpoints)
+# For LoRA, save just the adapter (smallest checkpoint)
 adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
 trainer.model.save_pretrained(adapter_dir)
 
@@ -288,21 +296,15 @@ from peft import PeftModel
 base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
 eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
 
-# NEW CHANGE: patch BOTH forward paths on eval model as well
-if hasattr(eval_model, "model_forward"):
-    _orig_eval_model_forward = eval_model.model_forward
-    def _eval_model_forward_strip(*args, **kwargs):
-        kwargs.pop("input_ids", None)
-        kwargs.pop("attention_mask", None)
-        return _orig_eval_model_forward(*args, **kwargs)
-    eval_model.model_forward = _eval_model_forward_strip
-
-_orig_eval_forward = eval_model.forward
-def _eval_forward_strip(*args, **kwargs):
-    kwargs.pop("input_ids", None)
-    kwargs.pop("attention_mask", None)
-    return _orig_eval_forward(*args, **kwargs)
-eval_model.forward = _eval_forward_strip
+# --- apply the same Whisper-safe call patch on eval model ---
+try:
+    eval_model.model_forward = _whisper_safe_call.__get__(eval_model, type(eval_model))
+except Exception:
+    pass
+try:
+    eval_model.forward = _whisper_safe_call.__get__(eval_model, type(eval_model))
+except Exception:
+    pass
 
 # 2) Rebuild a lightweight eval-only trainer (no training)
 eval_args = Seq2SeqTrainingArguments(
@@ -312,7 +314,7 @@ eval_args = Seq2SeqTrainingArguments(
     generation_max_length=225,
     fp16=True,
     report_to=["none"],
-    remove_unused_columns=False,   # NEW CHANGE: mirror training
+    remove_unused_columns=False,   # mirror training
 )
 
 eval_trainer = Seq2SeqTrainer(
