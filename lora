@@ -71,7 +71,7 @@ raw_datasets
 # ==========================================
 from transformers import WhisperProcessor
 
-# use your local copy (from screenshot)
+# use your local copy
 whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
 processor = WhisperProcessor.from_pretrained(
     whisper_loc, language="English", task="transcribe"
@@ -129,23 +129,51 @@ lora_cfg = LoraConfig(
     task_type=_task_type,
     target_modules=["q_proj", "k_proj", "v_proj", "out_proj"],  # attention projections
 )
+peft_model = get_peft_model(model, lora_cfg)
 
-peft_model = get_peft_model(model, lora_cfg)  # keep as separate var for clarity
-
-# ---------- NEW CHANGE: tiny training wrapper to GUARANTEE grads on LoRA ----------
-# We avoid PEFT's text-centric forward path entirely during training by
-# calling the Whisper base model (which already contains LoRA-injected layers).
+# ---------- NEW CHANGE: tiny training wrapper that keeps PEFT hooks + guarantees grads ----------
 class WhisperLoRAForTraining(torch.nn.Module):
+    """
+    Delegates params/methods to the PEFT model so Trainer sees expected APIs
+    (e.g., gradient_checkpointing_enable) and optimizer gets LoRA params.
+    Calls the Whisper base inside PEFT's forward-hook context using only
+    speech-friendly kwargs (input_features, labels).
+    """
     def __init__(self, peft_model):
         super().__init__()
-        self.peft = peft_model  # child module -> its parameters are trainable
-        self.base = peft_model.base_model
+        self.peft = peft_model
+        self.base = peft_model.base_model  # underlying Whisper
 
+    # ---- delegate common Trainer calls to the PEFT model ----
+    def parameters(self, *a, **k): return self.peft.parameters(*a, **k)
+    def named_parameters(self, *a, **k): return self.peft.named_parameters(*a, **k)
+    def state_dict(self, *a, **k): return self.peft.state_dict(*a, **k)
+    def train(self, mode: bool = True):
+        self.peft.train(mode); return super().train(mode)
+    def eval(self): self.peft.eval(); return super().eval()
+    def to(self, *a, **k): self.peft.to(*a, **k); return super().to(*a, **k)
+    def gradient_checkpointing_enable(self, **kw):
+        return self.peft.gradient_checkpointing_enable(**kw)
+    def gradient_checkpointing_disable(self):
+        return self.peft.gradient_checkpointing_disable()
+    def get_encoder(self):  # used by generate()
+        return self.peft.get_encoder()
+
+    # ---- whisper-safe forward ----
     def forward(self, input_features=None, labels=None, **kwargs):
-        # pass only what Whisper expects; everything else ignored
+        kwargs.pop("input_ids", None)
+        kwargs.pop("attention_mask", None)
+        # Keep only things Whisper understands (+ encoder_* passthroughs if present)
+        allow = {"input_features", "labels", "decoder_input_ids", "decoder_attention_mask",
+                 "return_dict", "output_attentions", "output_hidden_states", "use_cache"}
+        kwargs = {k: v for k, v in kwargs.items() if k in allow or k.startswith("encoder_")}
+        ctx_mgr = getattr(self.peft, "_enable_peft_forward_hooks", None)
+        if callable(ctx_mgr):
+            with ctx_mgr(**kwargs):
+                return self.base(input_features=input_features, labels=labels, return_dict=True)
         return self.base(input_features=input_features, labels=labels, return_dict=True)
 
-# This is the model we hand to Trainer for training.
+# This is what we give to Trainer for training:
 train_model = WhisperLoRAForTraining(peft_model)
 # ----------------------------------------------------------------------------------
 
@@ -213,7 +241,7 @@ training_args = Seq2SeqTrainingArguments(
     fp16=True,
     evaluation_strategy="steps",
     per_device_eval_batch_size=4,
-    predict_with_generate=False,   # NEW CHANGE: avoid generation inside training loop
+    predict_with_generate=False,     # NEW CHANGE: keep training path simple; we eval separately
     generation_max_length=225,
     seed=91,
     logging_steps=5,
@@ -221,13 +249,13 @@ training_args = Seq2SeqTrainingArguments(
     save_strategy="steps",
     save_total_limit=2,
     report_to=["none"],
-    load_best_model_at_end=True,  # THIS IS IMPORTANT
+    load_best_model_at_end=True,     # THIS IS IMPORTANT
     metric_for_best_model="wer",
     greater_is_better=False,
     push_to_hub=False,
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
-    remove_unused_columns=False,   # safer for audio models
+    remove_unused_columns=False,     # NEW CHANGE: safer for audio models
 )
 
 # CHANGE: avoid saving optimizer/scheduler into checkpoints to fix zip write error
@@ -255,17 +283,17 @@ from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
-    model=train_model,  # NEW CHANGE: wrapper that guarantees gradient flow to LoRA
+    model=train_model,                 # NEW CHANGE: wrapper that guarantees grad flow and APIs
     train_dataset=vectorized_datasets["train"],
     eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
-    compute_metrics=None,        # NEW CHANGE: no gen during training; compute after
+    compute_metrics=None,              # NEW CHANGE: no gen during train; compute in eval
     tokenizer=processor,
 )
 
 trainer.train()
 
-# (Optional) final save: save just the adapter (small checkpoint)
+# (Optional) final save: save just the adapter (smallest checkpoint)
 adapter_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_v1_adapter"
 peft_model.save_pretrained(adapter_dir)  # save the real PEFT model’s adapter
 
@@ -286,8 +314,7 @@ from peft import PeftModel
 base_model = WhisperForConditionalGeneration.from_pretrained(SAVED_BASE_DIR)
 eval_model = PeftModel.from_pretrained(base_model, SAVED_ADAPTER_DIR)
 
-# (Optional safety) Whisper doesn’t need/accept text inputs; Trainer won't pass any now,
-# but if your environment still injects them, you can keep the two-line guard:
+# (Optional safety) drop text-style kwargs if any path injects them
 _orig_fwd = eval_model.forward
 def _strip_texty(*a, **kw):
     kw.pop("input_ids", None); kw.pop("attention_mask", None)
@@ -305,7 +332,6 @@ eval_args = Seq2SeqTrainingArguments(
     remove_unused_columns=False,
 )
 
-# Use metrics again for eval only
 eval_trainer = Seq2SeqTrainer(
     args=eval_args,
     model=eval_model,
@@ -345,7 +371,6 @@ for i, (hyp, ref) in enumerate(zip(pred_str, label_str)):
         "wer": round(w, 2),
     })
 
-import pandas as pd
 df = pd.DataFrame(rows)
 df.to_csv(CSV_OUT, index=False, encoding="utf-8")
 print("Saved detailed predictions to:", CSV_OUT)
