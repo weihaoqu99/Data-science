@@ -1,134 +1,123 @@
 # =========================================================
 # Distil-Whisper Large V2 — LoRA (no PEFT) fine-tuning
-# Safe save + clean warnings version
+# Clean HF warnings + safe saving
 # =========================================================
-
 import os, glob, math, torch
 import torch.nn as nn
 from datasets import Dataset, Audio
 
-# GPU pin (change if needed)
+# Optional: hush HF advisory spam (doesn't hide real errors)
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
+
+# Pin GPU if you like
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-# ---------- Data Prep ----------
+# --------------------- Data prep -------------------------
 audio_files = glob.glob("/appdata/cortex/dev1/origAudio/*.mp3")
 
-def retrieve_transcript(input_str: str) -> str:
-    tmp = input_str[input_str.rfind("/") + 1:-4]
-    tmp = tmp.replace("im", "i'm")
-    tmp = tmp.replace("shell", "she'll")
-    tmp = tmp.replace("dont", "don't")
-    tmp = tmp.capitalize()
-    tmp = tmp.replace("i ", "I ")
+def retrieve_transcript(p: str) -> str:
+    tmp = p[p.rfind("/") + 1:-4]
+    tmp = tmp.replace("im", "i'm").replace("shell", "she'll").replace("dont", "don't")
+    tmp = tmp.capitalize().replace("i ", "I ")
     return tmp
 
 transcripts = [retrieve_transcript(s) for s in audio_files]
-num_samples = len(audio_files)
+raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
+    "audio", Audio(sampling_rate=16000)
+).train_test_split(test_size=0.15, seed=91)
 
-raw_ds = Dataset.from_dict(
-    {"audio": audio_files[:num_samples], "sentence": transcripts[:num_samples]}
-).cast_column("audio", Audio(sampling_rate=16000))
-
-raw_ds = raw_ds.train_test_split(test_size=0.15, seed=91)
-
-# ---------- Processor ----------
+# --------------------- Processor -------------------------
 from transformers import WhisperProcessor
-
 whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
-processor = WhisperProcessor.from_pretrained(
-    whisper_loc, language="english", task="transcribe"
-)
+processor = WhisperProcessor.from_pretrained(whisper_loc, language="english", task="transcribe")
+
+# Make the FE return attention masks so generate() won't warn
+processor.feature_extractor.return_attention_mask = True
 
 def prepare_dataset(batch):
-    audio = batch["audio"]
+    a = batch["audio"]
     batch["input_features"] = processor.feature_extractor(
-        audio["array"], sampling_rate=audio["sampling_rate"]
+        a["array"], sampling_rate=a["sampling_rate"]
     )["input_features"][0]
     batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
     return batch
 
-vectorized = raw_ds.map(
+vectorized = raw.map(
     prepare_dataset,
-    remove_columns=raw_ds["train"].column_names,
+    remove_columns=raw["train"].column_names,
     num_proc=8,
 )
 
-# ---------- Model ----------
-from transformers import WhisperForConditionalGeneration
-
+# --------------------- Model -----------------------------
+from transformers import WhisperForConditionalGeneration, GenerationConfig
 model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
 
-# Resolve config warnings / conflicts
+# Avoid task/forced-ids conflict + tie/save issues
 model.config.task = "transcribe"
 model.config.language = "english"
-model.config.forced_decoder_ids = None                # conflict with task=transcribe
-model.config.tie_word_embeddings = False              # avoid tying conflicts in forks
+model.config.forced_decoder_ids = None
+model.config.use_cache = False
+model.config.tie_word_embeddings = False
 
-# Put generation params in generation_config (future-proof vs HF >=4.41)
-gen = model.generation_config
+# Build a clean GenerationConfig FROM the model config (captures defaults),
+# then override only what you need and attach it to the model.
+gen = GenerationConfig.from_model_config(model.config)
 gen.max_length = 448
-gen.suppress_tokens = []           # customize if you use suppressions
-gen.begin_suppress_tokens = [220, 50257]  # keep if you had them before
+# Keep/override these as you need; empty here to mirror your run
+gen.suppress_tokens = []
+gen.begin_suppress_tokens = [220, 50257]
+model.generation_config = gen
 
-# ---------- LoRA (no PEFT) ----------
+# Scrub generation keys from model.config so HF doesn't warn about them living there
+for k in ("suppress_tokens", "begin_suppress_tokens", "max_length"):
+    if hasattr(model.config, k):
+        try:
+            delattr(model.config, k)
+        except Exception:
+            setattr(model.config, k, None)
+
+# --------------------- LoRA (no PEFT) --------------------
 class LoRALinear(nn.Module):
     def __init__(self, orig_linear: nn.Linear, r: int = 64, alpha: int = 32, dropout: float = 0.1):
         super().__init__()
-        self.orig_linear = orig_linear
-        self.r = r
-        self.alpha = alpha
+        self.orig = orig_linear
         self.scaling = alpha / r
-        self.dropout = nn.Dropout(dropout)
-
-        self.lora_A = nn.Linear(orig_linear.in_features, r, bias=False)
-        self.lora_B = nn.Linear(r, orig_linear.out_features, bias=False)
-
-        nn.init.kaiming_uniform_(self.lora_A.weight, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B.weight)
-
-        for p in self.orig_linear.parameters():
+        self.drop = nn.Dropout(dropout)
+        self.A = nn.Linear(orig_linear.in_features, r, bias=False)
+        self.B = nn.Linear(r, orig_linear.out_features, bias=False)
+        nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
+        nn.init.zeros_(self.B.weight)
+        for p in self.orig.parameters():
             p.requires_grad = False
 
     def forward(self, x):
-        return self.orig_linear(x) + self.lora_B(self.lora_A(self.dropout(x))) * self.scaling
+        return self.orig(x) + self.B(self.A(self.drop(x))) * self.scaling
 
-def _set_module(root, path, new_module):
-    parts = path.split(".")
-    parent = root
+def _set_module(root, path, new):
+    parts, parent = path.split("."), root
     for p in parts[:-1]:
         parent = getattr(parent, p)
-    setattr(parent, parts[-1], new_module)
+    setattr(parent, parts[-1], new)
 
-def add_lora_to_whisper(model: nn.Module, r=64, alpha=32, dropout=0.1):
-    """
-    Wrap ONLY safe Linear layers inside encoder/decoder blocks:
-    - attention q/k/v/out
-    - MLP fc1/fc2
-    Skip embeddings, lm_head, and projection heads (shared/tied weights).
-    """
-    TARGET_KEYS = (
-        "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj",
-        "encoder_attn.q_proj", "encoder_attn.k_proj", "encoder_attn.v_proj", "encoder_attn.out_proj",
-        "fc1", "fc2", "mlp.fc1", "mlp.fc2"
+def add_lora_to_whisper(m: nn.Module, r=64, alpha=32, dropout=0.1):
+    TARGET = (
+        "self_attn.q_proj","self_attn.k_proj","self_attn.v_proj","self_attn.out_proj",
+        "encoder_attn.q_proj","encoder_attn.k_proj","encoder_attn.v_proj","encoder_attn.out_proj",
+        "fc1","fc2","mlp.fc1","mlp.fc2"
     )
     SKIP = ("embed", "lm_head", "proj_out", "project_out", "token")
-    for name, module in list(model.named_modules()):
-        if isinstance(module, nn.Linear):
-            if any(s in name for s in SKIP):
+    for name, mod in list(m.named_modules()):
+        if isinstance(mod, nn.Linear):
+            if any(s in name for s in SKIP):      # keep shared/tied layers untouched
                 continue
-            if not any(k in name for k in TARGET_KEYS):
+            if not any(t in name for t in TARGET):
                 continue
-            _set_module(model, name, LoRALinear(module, r=r, alpha=alpha, dropout=dropout))
-    return model
+            _set_module(m, name, LoRALinear(mod, r=r, alpha=alpha, dropout=dropout))
+    return m
 
 model = add_lora_to_whisper(model, r=64, alpha=32, dropout=0.1)
 
-# Quick trainable % check
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Trainable params: {trainable} / {total} ({100*trainable/total:.2f}%)")
-
-# ---------- Data collator ----------
+# --------------------- Collator --------------------------
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
@@ -138,26 +127,22 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": f["input_features"]} for f in features]
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-
-        label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-
-        # ensure decoder start token handling mirrors Whisper training
+        inp = [{"input_features": f["input_features"]} for f in features]
+        batch = self.processor.feature_extractor.pad(inp, return_tensors="pt", return_attention_mask=True)
+        # labels
+        lab = [{"input_ids": f["labels"]} for f in features]
+        lab_pad = self.processor.tokenizer.pad(lab, return_tensors="pt")
+        labels = lab_pad["input_ids"].masked_fill(lab_pad.attention_mask.ne(1), -100)
         if (labels[:, 0] != self.decoder_start_token_id).all():
             labels = labels[:, 1:]
-
         batch["labels"] = labels
         return batch
 
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-    processor=processor,
-    decoder_start_token_id=model.config.decoder_start_token_id,
+    processor=processor, decoder_start_token_id=model.config.decoder_start_token_id
 )
 
-# ---------- Metrics ----------
+# --------------------- Metrics ---------------------------
 import evaluate
 metric = evaluate.load("wer")
 
@@ -165,12 +150,11 @@ def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    pred_str  = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
+    return {"wer": 100 * metric.compute(predictions=pred_str, references=label_str)}
 
-# ---------- Training ----------
+# --------------------- Training --------------------------
 from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
 
 training_args = Seq2SeqTrainingArguments(
@@ -181,8 +165,7 @@ training_args = Seq2SeqTrainingArguments(
     warmup_steps=400,
     max_steps=1000,
     gradient_checkpointing=True,
-    # Silence future PyTorch warning about reentrant checkpointing:
-    gradient_checkpointing_kwargs={"use_reentrant": False},
+    gradient_checkpointing_kwargs={"use_reentrant": False},  # silence PyTorch warning
     fp16=True,
 
     evaluation_strategy="steps",
@@ -206,11 +189,11 @@ training_args = Seq2SeqTrainingArguments(
     dataloader_prefetch_factor=2,
     remove_unused_columns=False,
 
-    # >>> avoids the save-time shared tensor crash
+    # Prevent shared-tensor crash when saving custom LoRA-wrapped modules
     save_safetensors=False,
 )
 
-# (Older transformers fallback—safe if absent)
+# Fallback in case your transformers version doesn't forward kwargs:
 try:
     model.gradient_checkpointing_enable(use_reentrant=False)
 except TypeError:
@@ -224,6 +207,7 @@ trainer = Seq2SeqTrainer(
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     tokenizer=processor,
+    generation_config=model.generation_config,  # explicit for HF >= 4.41+
 )
 
 trainer.train()
