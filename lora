@@ -1,151 +1,202 @@
-# =========================================================
-# Distil-Whisper Large V2 — LoRA (no PEFT) fine-tuning
-# RS-LoRA enabled, works on older transformers
-# =========================================================
-import os, glob, math, torch
-import torch.nn as nn
+# %%
+import os
+os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+
 from datasets import Dataset, Audio
+import glob
 
-# (optional) pick a GPU
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# (optional) hush advisory warnings from HF
-os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "1"
-
-# --------------------- Data prep -------------------------
+# Collect audio files
 audio_files = glob.glob("/appdata/cortex/dev1/origAudio/*.mp3")
 
-def retrieve_transcript(p: str) -> str:
-    tmp = p[p.rfind("/") + 1:-4]
-    tmp = tmp.replace("im", "i'm").replace("shell", "she'll").replace("dont", "don't")
-    tmp = tmp.capitalize().replace("i ", "I ")
+# Transcript extractor
+def retrieve_transcript(input_str: str) -> str:
+    tmp = input_str[input_str.find("-")+1:-4]  # strip out track number and .mp3 suffix
+    tmp = tmp.replace("_", " ")
+    tmp = tmp.replace(".", " ")
+    tmp = tmp.replace("shell", "she'll")
+    tmp = tmp.replace("dont", "don't")
+    tmp = tmp.capitalize()
+    tmp = tmp.replace("i ", "I ")
     return tmp
 
 transcripts = [retrieve_transcript(s) for s in audio_files]
 
-raw = Dataset.from_dict({"audio": audio_files, "sentence": transcripts}).cast_column(
-    "audio", Audio(sampling_rate=16000)
-).train_test_split(test_size=0.15, seed=91)
+# Dataset preparation
+num_samples = len(audio_files)
 
-# --------------------- Processor -------------------------
+raw_datasets = Dataset.from_dict({
+    "audio": audio_files[:num_samples],
+    "sentence": transcripts[:num_samples]
+}).cast_column("audio", Audio(sampling_rate=16_000))
+
+raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
+
+# %%
+[i["sentence"] for i in raw_datasets['train']]
+
+# %%
 from transformers import WhisperProcessor
+
+# whisper_loc = "/appdata/cortex/dev1/aptaiModels/whisper-large-v2"
 whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
+processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
 
-processor = WhisperProcessor.from_pretrained(
-    whisper_loc, language="english", task="transcribe"
-)
-# give generate()/model an attention mask (quiet “pad==eos” warning)
-processor.feature_extractor.return_attention_mask = True
-
+# Dataset pre-processing
 def prepare_dataset(batch):
-    a = batch["audio"]
+    # Load and (possibly) resample audio data to 16kHz
+    audio = batch["audio"]
     batch["input_features"] = processor.feature_extractor(
-        a["array"], sampling_rate=a["sampling_rate"]
-    )["input_features"][0]
-    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+        audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+
+    # Encode target text
+    transcription = batch["sentence"]
+    batch["labels"] = processor.tokenizer(transcription).input_ids
     return batch
 
-vectorized = raw.map(
+vectorized_datasets = raw_datasets.map(
     prepare_dataset,
-    remove_columns=raw["train"].column_names,
-    num_proc=8,
+    remove_columns=raw_datasets["train"].column_names,
+    num_proc=8
 )
 
-# --------------------- Model -----------------------------
-from transformers import WhisperForConditionalGeneration, GenerationConfig
+# %%
+from transformers import WhisperForConditionalGeneration
 
 model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-
-# Resolve HF config warnings/conflicts
-model.config.task = "transcribe"
-model.config.language = "english"
 model.config.forced_decoder_ids = None
-model.config.use_cache = False                     # ok with gradient checkpointing
-model.config.tie_word_embeddings = False           # avoid tying conflicts when saving custom modules
+model.config.suppress_tokens = []
+model.config.use_cache = False   # incompatible with gradient checkpointing
+model.config.language = "english"
+model.config.task = "transcribe"
 
-# Put generation params into a GenerationConfig (future-proof)
-gen = GenerationConfig.from_model_config(model.config)
-gen.max_length = 448
-gen.suppress_tokens = []
-gen.begin_suppress_tokens = [220, 50257]
-model.generation_config = gen
+# -------- LoRA (no PEFT) ----------
+import math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union, Iterable
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-# Scrub any duplicates from model.config (prevents warnings on older HF)
-for k in ("suppress_tokens", "begin_suppress_tokens", "max_length"):
-    if hasattr(model.config, k):
-        try:
-            delattr(model.config, k)
-        except Exception:
-            setattr(model.config, k, None)
-
-# --------------------- LoRA (no PEFT) --------------------
-# RS-LoRA: scale by alpha/r and initialize B with std ~ 1/r to stabilize large-r training
 class LoRALinear(nn.Module):
-    def __init__(
-        self,
-        orig_linear: nn.Linear,
-        r: int = 64,
-        alpha: int = 32,
-        dropout: float = 0.1,
-        use_rslora: bool = True,   # <- RS-LoRA on
-    ):
+    """
+    Drop-in wrapper for nn.Linear that adds a low-rank update AxB^T.
+    Base weight W is frozen; only A/B (and optionally a rescale 'g') train.
+    """
+    def __init__(self, base_linear: nn.Linear, r: int = 8, alpha: int = 16,
+                 dropout: float = 0.05, rs_lora: bool = True):
         super().__init__()
-        self.orig = orig_linear
+        assert r > 0, "LoRA rank r must be > 0"
+        self.in_features  = base_linear.in_features
+        self.out_features = base_linear.out_features
+        self.r = r
         self.scaling = alpha / r
-        self.drop = nn.Dropout(dropout)
-        self.A = nn.Linear(orig_linear.in_features, r, bias=False)
-        self.B = nn.Linear(r, orig_linear.out_features, bias=False)
+        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
+        self.rs_lora = rs_lora
 
-        # LoRA init
-        nn.init.kaiming_uniform_(self.A.weight, a=math.sqrt(5))
-        if use_rslora:
-            # RS-LoRA style: small-N(0, 1/r) for B improves stability with larger r
-            nn.init.normal_(self.B.weight, std=1.0 / r)
+        # The frozen base weight/bias (copied reference)
+        self.weight = base_linear.weight
+        self.bias   = base_linear.bias
+
+        # LoRA A and B
+        # A: (out_features, r)  B: (r, in_features) using "fan-in" init for stability
+        self.lora_A = nn.Parameter(torch.zeros((self.r, self.in_features)))
+        self.lora_B = nn.Parameter(torch.zeros((self.out_features, self.r)))
+
+        # RS-LoRA scaling parameter (vector) — improves stability for large rank
+        if self.rs_lora:
+            self.register_parameter("lora_g", nn.Parameter(torch.ones(self.out_features)))
         else:
-            nn.init.zeros_(self.B.weight)
+            self.lora_g = None
 
-        # freeze base
-        for p in self.orig.parameters():
-            p.requires_grad = False
+        # Init: A ~ N(0, 1/in), B = 0 -> starts as identity update
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+        nn.init.zeros_(self.lora_B)
 
-    def forward(self, x):
-        return self.orig(x) + self.B(self.A(self.drop(x))) * self.scaling
+        # Freeze base weight/bias
+        self.weight.requires_grad = False
+        if self.bias is not None:
+            self.bias.requires_grad = False
 
-def _set_module(root, path, new):
-    parts, parent = path.split("."), root
-    for p in parts[:-1]:
-        parent = getattr(parent, p)
-    setattr(parent, parts[-1], new)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base = F.linear(x, self.weight, self.bias)
+        # LoRA update
+        x_d = self.dropout(x)
+        # (N, in) x (r, in)^T -> (N, r); then (N, r) x (out, r)^T -> (N, out)
+        update = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
+        if self.rs_lora and self.lora_g is not None:
+            # rank-stabilized scaling
+            update = update * self.lora_g
+        return base + self.scaling * update
 
-def add_lora_to_whisper(m: nn.Module, r=64, alpha=32, dropout=0.1, use_rslora=True):
+def _replace_module(parent: nn.Module, child_name: str, new_module: nn.Module):
+    """Replace `parent.child_name` with `new_module`."""
+    setattr(parent, child_name, new_module)
+
+def add_lora_to_whisper(
+    model: WhisperForConditionalGeneration,
+    r: int = 8,
+    alpha: int = 16,
+    dropout: float = 0.05,
+    target_modules: Iterable[str] = ("q_proj", "v_proj"),
+    rs_lora: bool = True,
+):
     """
-    Wrap ONLY safe Linear layers inside encoder/decoder blocks:
-    - attention q/k/v/out
-    - MLP fc1/fc2
-    Skip embeddings, lm_head, and projection heads (shared/tied).
+    Inject LoRA into Whisper attention linear layers.
+    target_modules usually subset of {'q_proj','k_proj','v_proj','out_proj'}.
     """
-    TARGET = (
-        "self_attn.q_proj","self_attn.k_proj","self_attn.v_proj","self_attn.out_proj",
-        "encoder_attn.q_proj","encoder_attn.k_proj","encoder_attn.v_proj","encoder_attn.out_proj",
-        "fc1","fc2","mlp.fc1","mlp.fc2"
-    )
-    SKIP = ("embed", "lm_head", "proj_out", "project_out", "token")
-    for name, mod in list(m.named_modules()):
-        if isinstance(mod, nn.Linear):
-            if any(s in name for s in SKIP):
-                continue
-            if not any(t in name for t in TARGET):
-                continue
-            _set_module(m, name, LoRALinear(mod, r=r, alpha=alpha, dropout=dropout, use_rslora=use_rslora))
-    return m
+    count = 0
 
-model = add_lora_to_whisper(model, r=64, alpha=32, dropout=0.1, use_rslora=True)
+    def maybe_wrap(module: nn.Module, name: str, parent: nn.Module):
+        nonlocal count
+        if any(name.endswith(t) for t in target_modules):
+            if isinstance(module, nn.Linear):
+                wrapped = LoRALinear(module, r=r, alpha=alpha, dropout=dropout, rs_lora=rs_lora)
+                _replace_module(parent, name, wrapped)
+                count += 1
 
-# sanity check
-trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-total = sum(p.numel() for p in model.parameters())
-print(f"Trainable params: {trainable} / {total} ({100*trainable/total:.2f}%)")
+    # Walk encoder/decoder blocks and wrap attention projections
+    for name, module in model.model.named_modules():
+        # We need the parent to replace a child; iterate children per module
+        for child_name, child in list(module.named_children()):
+            if isinstance(child, nn.Linear) and any(child_name.endswith(t) for t in target_modules):
+                wrapped = LoRALinear(child, r=r, alpha=alpha, dropout=dropout, rs_lora=rs_lora)
+                _replace_module(module, child_name, wrapped)
+                count += 1
 
-# --------------------- Collator --------------------------
+    # Freeze everything except LoRA params (and LN if you like)
+    for n, p in model.named_parameters():
+        if "lora_" in n or n.endswith(".lora_g"):
+            p.requires_grad = True
+        else:
+            # keep layer norms trainable if desired:
+            if ".layer_norm" in n or "layer_norm." in n:
+                p.requires_grad = False
+            else:
+                p.requires_grad = False
+
+    print(f"[LoRA] Injected into {count} linear modules; r={r}, alpha={alpha}, rs_lora={rs_lora}")
+    return model
+
+# LoRA config — tweak if you want
+LORA_CFG = {
+    "r": 8,
+    "alpha": 16,
+    "dropout": 0.05,
+    "target_modules": ("q_proj", "v_proj"),  # typical choice for Whisper
+    "rs_lora": True,                          # <— your request
+}
+
+add_lora_to_whisper(model, **LORA_CFG)
+
+# (Optional) quick check of trainable parameter count
+def count_trainable(m):
+    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in m.parameters())
+    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.4f}%)")
+count_trainable(model)
+# -------- end LoRA ----------
+
+# %%
 from dataclasses import dataclass
 from typing import Any, Dict, List, Union
 
@@ -155,96 +206,84 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        inp = [{"input_features": f["input_features"]} for f in features]
-        batch = self.processor.feature_extractor.pad(
-            inp, return_tensors="pt", return_attention_mask=True
-        )
-        # labels
-        lab = [{"input_ids": f["labels"]} for f in features]
-        lab_pad = self.processor.tokenizer.pad(lab, return_tensors="pt")
-        labels = lab_pad["input_ids"].masked_fill(lab_pad.attention_mask.ne(1), -100)
-        if (labels[:, 0] != self.decoder_start_token_id).all():
+        # Prepare input features
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        batch = processor.feature_extractor.pad(input_features, return_tensors="pt")
+
+        # Prepare labels
+        label_features = [{"input_ids": f["labels"]} for f in features]
+        labels_batch = processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # Cut BOS if present
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
+
         batch["labels"] = labels
         return batch
 
+# %%
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(
-    processor=processor, decoder_start_token_id=model.config.decoder_start_token_id
+    processor=processor,
+    decoder_start_token_id=model.config.decoder_start_token_id,
 )
 
-# --------------------- Metrics ---------------------------
+# %%
 import evaluate
 metric = evaluate.load("wer")
 
 def compute_metrics(pred):
     pred_ids = pred.predictions
     label_ids = pred.label_ids
-    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    pred_str  = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    return {"wer": 100 * metric.compute(predictions=pred_str, references=label_str)}
 
-# --------------------- Training --------------------------
-from transformers import Seq2SeqTrainingArguments, Seq2SeqTrainer
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}
+
+# %%
+from transformers import Seq2SeqTrainingArguments
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./whisper-lora-like",
-    per_device_train_batch_size=2,
-    gradient_accumulation_steps=16,
-    learning_rate=4.083705401062e-05,
-    warmup_steps=400,
+    output_dir="./",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    learning_rate=5e-5,
+    warmup_steps=500,
     max_steps=1000,
-    gradient_checkpointing=True,          # keep; older transformers ignore kwargs param
+    gradient_checkpointing=True,
     fp16=True,
-
-    # (older transformers) 'evaluation_strategy' may warn but is OK
     evaluation_strategy="steps",
     per_device_eval_batch_size=4,
     predict_with_generate=True,
-    generation_max_length=176,
-
+    generation_max_length=225,
     seed=91,
     logging_steps=5,
     eval_steps=5,
-    save_steps=5,
     save_strategy="steps",
     save_total_limit=2,
     report_to=["none"],
-
     load_best_model_at_end=True,
     metric_for_best_model="wer",
     greater_is_better=False,
-
+    push_to_hub=False,
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
-    remove_unused_columns=False,
-
-    # Prevent shared-tensor crash when saving custom LoRA-wrapped modules
-    save_safetensors=False,
 )
 
-# Silence PyTorch’s re-entrant checkpointing warning on versions that support it
-try:
-    model.gradient_checkpointing_enable(use_reentrant=False)
-except TypeError:
-    pass
+# %%
+from transformers import Seq2SeqTrainer
 
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=vectorized["train"],
-    eval_dataset=vectorized["test"],
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
     compute_metrics=compute_metrics,
     tokenizer=processor,
-    # NOTE: do NOT pass generation_config= here (older transformers don't accept it)
 )
 
-# ---- Train ----
 trainer.train()
-
-# ---- Save final model + processor ----
-save_dir = "/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_Lora1"
-trainer.save_model(save_dir)
-processor.save_pretrained(save_dir)
-print(f"Model and processor saved to {save_dir}")
