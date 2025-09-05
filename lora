@@ -1,8 +1,5 @@
 # ============================================================
-# Whisper fine-tuning — your original pipeline + PEFT LoRA
-# - Version-safe: no unsupported TrainingArguments (num_beams, etc.)
-# - Modern 8-bit path via BitsAndBytesConfig with fallbacks
-# - Fixes 100-WER pitfalls (SOT, no forced IDs, safe padding)
+# Whisper fine-tuning — Original Code + Simple LoRA (PEFT)
 # ============================================================
 
 # --- imports
@@ -20,22 +17,20 @@ from transformers import (
     Seq2SeqTrainer,
 )
 
-# --- PEFT (LoRA)
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+# >>> LoRA (PEFT) — minimal <<<
+from peft import LoraConfig, get_peft_model
 
 # =============== ENV / PATHS ===============
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # e.g. "0" or "0,1,2,3"
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 AUDIO_GLOB = "/appdata/cortex/dev1/origAudio/*.mp3"
 
-# Base model (as in your notebook)
 # whisper_loc = "/appdata/cortex/dev1/aptaiModels/whisper-large-v2"
 whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
 
-# =============== DATASET (your original style) ===============
+# =============== DATASET ===============
 audio_files = glob.glob(AUDIO_GLOB)
 
 def retrieve_transcript(input_str: str) -> str:
-    # strip leading "{track}-" and trailing ".mp3"
     tmp = input_str[input_str.find("-")+1:-4]
     tmp = tmp.replace("_", " ").replace(".", " ")
     tmp = tmp.replace("shell", "she'll").replace("dont", "don't")
@@ -69,90 +64,44 @@ vectorized_datasets = raw_datasets.map(
     num_proc=8
 )
 
-# =============== LOAD MODEL (8-bit if available; no deprecation warnings) ===============
-eight_bit = False
-try:
-    # Preferred path on newer Transformers (avoids load_in_8bit deprecation)
-    from transformers import BitsAndBytesConfig
-    quant_cfg = BitsAndBytesConfig(load_in_8bit=True)
-    model = WhisperForConditionalGeneration.from_pretrained(
-        whisper_loc, quantization_config=quant_cfg, device_map="auto"
-    )
-    eight_bit = True
-except Exception:
-    # Fallback to older API or fp16 if bitsandbytes not present
-    try:
-        model = WhisperForConditionalGeneration.from_pretrained(
-            whisper_loc, load_in_8bit=True, device_map="auto"
-        )
-        eight_bit = True
-    except Exception:
-        model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        model.to(device)
+# =============== LOAD MODEL ===============
+model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
 
-# ---- critical Whisper config (prevents 100 WER) ----
+# Important config
 processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
 model.config.pad_token_id = processor.tokenizer.pad_token_id
-
-# Decoder start (SOT) for English transcription
 if getattr(processor.tokenizer, "sot_token_id", None) is not None:
     model.config.decoder_start_token_id = processor.tokenizer.sot_token_id
-
-# Avoid prefix conflicts — let generation handle prompts naturally
 model.config.forced_decoder_ids = None
-model.generation_config.forced_decoder_ids = None
 model.config.suppress_tokens = []
-model.generation_config.suppress_tokens = []
-
-# Training niceties
-model.config.use_cache = False      # enables gradient checkpointing
+model.config.use_cache = False
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# =============== APPLY PEFT LoRA (AWS/HF-style) ===============
-if eight_bit:
-    model = prepare_model_for_kbit_training(model)
-
-# LoRA configuration — matches common AWS/HF examples
-peft_kwargs = dict(
+# =============== SIMPLE LoRA (minimal) ===============
+lora_cfg = LoraConfig(
     r=32,
     lora_alpha=64,
-    target_modules=["q_proj", "v_proj"],
     lora_dropout=0.05,
+    target_modules=["q_proj", "v_proj"],
     bias="none",
 )
-
-# Try RS-LoRA if your PEFT supports it; otherwise standard LoRA
-try:
-    lora_cfg = LoraConfig(use_rslora=True, **peft_kwargs)
-except TypeError:
-    lora_cfg = LoraConfig(**peft_kwargs)
-
 model = get_peft_model(model, lora_cfg)
-model.print_trainable_parameters()
 
-# =============== COLLATOR (original style, with safe masking) ===============
+# =============== COLLATOR ===============
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # inputs
         input_features = [{"input_features": f["input_features"]} for f in features]
         batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        # labels (pad → mask → -100)
         label_features = [{"input_ids": f["labels"]} for f in features]
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"]
-        lamask = labels_batch["attention_mask"]
+        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
 
-        # ignore PAD in loss
-        labels = labels.masked_fill(lamask.ne(1), -100)
-
-        # drop SOT/BOS if present at position 0
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
@@ -164,11 +113,10 @@ data_collator = DataCollatorSpeechSeq2SeqWithPadding(
     decoder_start_token_id=model.config.decoder_start_token_id,
 )
 
-# =============== METRIC (WER) ===============
+# =============== METRIC ===============
 metric = evaluate.load("wer")
 
 def compute_metrics(pred):
-    # pred.predictions may be a tuple; handle both
     pred_ids = pred.predictions[0] if isinstance(pred.predictions, (tuple, list)) else pred.predictions
     label_ids = torch.tensor(pred.label_ids)
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
@@ -176,20 +124,19 @@ def compute_metrics(pred):
 
     pred_str  = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
     label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-    wer = 100.0 * metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer}
+    return {"wer": 100.0 * metric.compute(predictions=pred_str, references=label_str)}
 
-# =============== TRAINING ARGS (close to your original; version-safe) ===============
+# =============== TRAINING ARGS ===============
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./whisper_peft_lora_out",
-    remove_unused_columns=False,     # keep "input_features"
+    output_dir="./whisper_lora_out",
+    remove_unused_columns=False,
     label_names=["labels"],
     per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
     gradient_accumulation_steps=8,
     learning_rate=1e-5,
     warmup_steps=200,
-    max_steps=1000,                  # you used steps; keep it
+    max_steps=1000,
     evaluation_strategy="steps",
     eval_steps=5,
     logging_steps=5,
@@ -200,17 +147,13 @@ training_args = Seq2SeqTrainingArguments(
     greater_is_better=False,
     predict_with_generate=True,
     generation_max_length=225,
-    # IMPORTANT: Do not pass unsupported args like `num_beams` or `do_sample` here.
-    # We'll stick with defaults for wide version compatibility.
-    fp16=not eight_bit,
+    fp16=True,
     gradient_checkpointing=True,
     dataloader_num_workers=8,
-    # Avoid uncommon/older-incompatible args:
-    # dataloader_prefetch_factor is omitted for compatibility.
-    report_to=[],                    # no TB/W&B
+    report_to=[],
 )
 
-# =============== TRAINER (original flow) ===============
+# =============== TRAINER ===============
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
@@ -221,30 +164,11 @@ trainer = Seq2SeqTrainer(
     tokenizer=processor,
 )
 
-# =============== (Optional) QUICK SMOKE TEST ===============
-if True:
-    from torch.utils.data import DataLoader
-    tmp_loader = DataLoader(vectorized_datasets["test"], batch_size=2, collate_fn=data_collator)
-    batch = next(iter(tmp_loader))
-    model.eval()
-    with torch.no_grad():
-        gen = model.generate(
-            input_features=batch["input_features"].to(model.device),
-            max_new_tokens=64,  # keep short
-        )
-    pred = processor.tokenizer.batch_decode(gen, skip_special_tokens=True)
-    gold = processor.tokenizer.batch_decode(
-        batch["labels"].masked_fill(batch["labels"] == -100, processor.tokenizer.pad_token_id),
-        skip_special_tokens=True
-    )
-    print("SMOKE TEST — PRED:", pred)
-    print("SMOKE TEST — GOLD:", gold[:len(pred)])
-
 # =============== TRAIN & SAVE ===============
 trainer.train()
 
-# Save ONLY the LoRA adapter (PEFT best practice)
-adapter_dir = "/appdata/cortex/dev1/shob/ASR_models/asr_finetuning/whisper_peft_lora_adapter"
+# Save only the LoRA adapter (small and reusable)
+adapter_dir = "/appdata/cortex/dev1/shob/ASR_models/asr_finetuning/whisper_lora_adapter"
 model.save_pretrained(adapter_dir)
 processor.save_pretrained(adapter_dir)
 print(f"Saved LoRA adapter + processor to: {adapter_dir}")
