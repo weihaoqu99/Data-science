@@ -1,56 +1,70 @@
-# %%
-import os
-os.environ['CUDA_VISIBLE_DEVICES'] = "1"
+# ============================================================
+# Whisper fine-tuning — your original pipeline + PEFT LoRA
+# - Keeps your filename→transcript dataset builder
+# - Adds LoRA (q/v projections) with AWS/HF-style params
+# - Fixes WER=100 pitfalls (SOT token, no forced IDs, safe padding)
+# - Tries 8-bit loading; falls back to fp16 automatically
+# ============================================================
 
+# --- imports
+import os, glob, math
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+import torch
+import torch.nn as nn
+import evaluate
 from datasets import Dataset, Audio
-import glob
+from transformers import (
+    WhisperProcessor,
+    WhisperForConditionalGeneration,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+)
 
-# Collect audio files
-audio_files = glob.glob("/appdata/cortex/dev1/origAudio/*.mp3")
+# --- PEFT (LoRA)
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# Transcript extractor
+# =============== ENV / PATHS ===============
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # or "1" or "0,1,2,3"
+AUDIO_GLOB = "/appdata/cortex/dev1/origAudio/*.mp3"
+
+# Choose your base model path (as in your notebook)
+# whisper_loc = "/appdata/cortex/dev1/aptaiModels/whisper-large-v2"
+whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
+
+# =============== DATASET (your original style) ===============
+audio_files = glob.glob(AUDIO_GLOB)
+
 def retrieve_transcript(input_str: str) -> str:
-    tmp = input_str[input_str.find("-")+1:-4]  # strip out track number and .mp3 suffix
-    tmp = tmp.replace("_", " ")
-    tmp = tmp.replace(".", " ")
-    tmp = tmp.replace("shell", "she'll")
-    tmp = tmp.replace("dont", "don't")
-    tmp = tmp.capitalize()
-    tmp = tmp.replace("i ", "I ")
+    # strip leading "track-" (or similar) and trailing ".mp3"
+    tmp = input_str[input_str.find("-")+1:-4]
+    tmp = tmp.replace("_", " ").replace(".", " ")
+    tmp = tmp.replace("shell", "she'll").replace("dont", "don't")
+    tmp = tmp.capitalize().replace("i ", "I ")
     return tmp
 
 transcripts = [retrieve_transcript(s) for s in audio_files]
-
-# Dataset preparation
 num_samples = len(audio_files)
 
 raw_datasets = Dataset.from_dict({
     "audio": audio_files[:num_samples],
-    "sentence": transcripts[:num_samples]
+    "sentence": transcripts[:num_samples],
 }).cast_column("audio", Audio(sampling_rate=16_000))
 
 raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
 
-# %%
-[i["sentence"] for i in raw_datasets['train']]
-
-# %%
-from transformers import WhisperProcessor
-
-# whisper_loc = "/appdata/cortex/dev1/aptaiModels/whisper-large-v2"
-whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
+# =============== PROCESSOR & FEATURE PREP ===============
 processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
 
-# Dataset pre-processing
 def prepare_dataset(batch):
-    # Load and (possibly) resample audio data to 16kHz
+    # log-Mel from audio
     audio = batch["audio"]
     batch["input_features"] = processor.feature_extractor(
-        audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-
-    # Encode target text
-    transcription = batch["sentence"]
-    batch["labels"] = processor.tokenizer(transcription).input_ids
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+    # tokenize label ids
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
     return batch
 
 vectorized_datasets = raw_datasets.map(
@@ -59,223 +73,141 @@ vectorized_datasets = raw_datasets.map(
     num_proc=8
 )
 
-# %%
-from transformers import WhisperForConditionalGeneration
+# =============== LOAD MODEL (8-bit if available) ===============
+eight_bit = False
+try:
+    model = WhisperForConditionalGeneration.from_pretrained(
+        whisper_loc,
+        load_in_8bit=True,      # memory saver if bitsandbytes installed
+        device_map="auto",
+    )
+    eight_bit = True
+except Exception:
+    model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
 
-model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+# ---- critical Whisper config (prevents 100 WER) ----
+# PAD=EOS (Whisper convention) — set on both tokenizer and model
+processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
+model.config.pad_token_id = processor.tokenizer.pad_token_id
+
+# Decoder start (SOT) for English transcription
+if getattr(processor.tokenizer, "sot_token_id", None) is not None:
+    model.config.decoder_start_token_id = processor.tokenizer.sot_token_id
+
+# Avoid prefix conflicts — let Trainer/generate handle prompts
 model.config.forced_decoder_ids = None
+model.generation_config.forced_decoder_ids = None
 model.config.suppress_tokens = []
-model.config.use_cache = False   # incompatible with gradient checkpointing
+model.generation_config.suppress_tokens = []
+
+# Training niceties
+model.config.use_cache = False      # enables gradient checkpointing
 model.config.language = "english"
 model.config.task = "transcribe"
 
-# -------- LoRA (no PEFT) ----------
-import math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union, Iterable
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# =============== APPLY PEFT LoRA (AWS/HF-style) ===============
+# Prepare for k-bit if we loaded in 8-bit
+if eight_bit:
+    model = prepare_model_for_kbit_training(model)
 
-class LoRALinear(nn.Module):
-    """
-    Drop-in wrapper for nn.Linear that adds a low-rank update AxB^T.
-    Base weight W is frozen; only A/B (and optionally a rescale 'g') train.
-    """
-    def __init__(self, base_linear: nn.Linear, r: int = 8, alpha: int = 16,
-                 dropout: float = 0.05, rs_lora: bool = True):
-        super().__init__()
-        assert r > 0, "LoRA rank r must be > 0"
-        self.in_features  = base_linear.in_features
-        self.out_features = base_linear.out_features
-        self.r = r
-        self.scaling = alpha / r
-        self.dropout = nn.Dropout(dropout) if dropout and dropout > 0 else nn.Identity()
-        self.rs_lora = rs_lora
+# LoRA configuration (you can tweak r/alpha/dropout)
+# Matches common AWS/HF examples: r=32, alpha=64, q/v only
+peft_kwargs = dict(
+    r=32,
+    lora_alpha=64,
+    target_modules=["q_proj", "v_proj"],
+    lora_dropout=0.05,
+    bias="none",
+)
 
-        # The frozen base weight/bias (copied reference)
-        self.weight = base_linear.weight
-        self.bias   = base_linear.bias
+# If your PEFT version supports RS-LoRA, enable it (safe try/except)
+try:
+    lora_cfg = LoraConfig(use_rslora=True, **peft_kwargs)
+except TypeError:
+    lora_cfg = LoraConfig(**peft_kwargs)
 
-        # LoRA A and B
-        # A: (out_features, r)  B: (r, in_features) using "fan-in" init for stability
-        self.lora_A = nn.Parameter(torch.zeros((self.r, self.in_features)))
-        self.lora_B = nn.Parameter(torch.zeros((self.out_features, self.r)))
+model = get_peft_model(model, lora_cfg)
+model.print_trainable_parameters()  # sanity check: only LoRA params should train
 
-        # RS-LoRA scaling parameter (vector) — improves stability for large rank
-        if self.rs_lora:
-            self.register_parameter("lora_g", nn.Parameter(torch.ones(self.out_features)))
-        else:
-            self.lora_g = None
-
-        # Init: A ~ N(0, 1/in), B = 0 -> starts as identity update
-        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
-        nn.init.zeros_(self.lora_B)
-
-        # Freeze base weight/bias
-        self.weight.requires_grad = False
-        if self.bias is not None:
-            self.bias.requires_grad = False
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base = F.linear(x, self.weight, self.bias)
-        # LoRA update
-        x_d = self.dropout(x)
-        # (N, in) x (r, in)^T -> (N, r); then (N, r) x (out, r)^T -> (N, out)
-        update = F.linear(F.linear(x_d, self.lora_A), self.lora_B)
-        if self.rs_lora and self.lora_g is not None:
-            # rank-stabilized scaling
-            update = update * self.lora_g
-        return base + self.scaling * update
-
-def _replace_module(parent: nn.Module, child_name: str, new_module: nn.Module):
-    """Replace `parent.child_name` with `new_module`."""
-    setattr(parent, child_name, new_module)
-
-def add_lora_to_whisper(
-    model: WhisperForConditionalGeneration,
-    r: int = 8,
-    alpha: int = 16,
-    dropout: float = 0.05,
-    target_modules: Iterable[str] = ("q_proj", "v_proj"),
-    rs_lora: bool = True,
-):
-    """
-    Inject LoRA into Whisper attention linear layers.
-    target_modules usually subset of {'q_proj','k_proj','v_proj','out_proj'}.
-    """
-    count = 0
-
-    def maybe_wrap(module: nn.Module, name: str, parent: nn.Module):
-        nonlocal count
-        if any(name.endswith(t) for t in target_modules):
-            if isinstance(module, nn.Linear):
-                wrapped = LoRALinear(module, r=r, alpha=alpha, dropout=dropout, rs_lora=rs_lora)
-                _replace_module(parent, name, wrapped)
-                count += 1
-
-    # Walk encoder/decoder blocks and wrap attention projections
-    for name, module in model.model.named_modules():
-        # We need the parent to replace a child; iterate children per module
-        for child_name, child in list(module.named_children()):
-            if isinstance(child, nn.Linear) and any(child_name.endswith(t) for t in target_modules):
-                wrapped = LoRALinear(child, r=r, alpha=alpha, dropout=dropout, rs_lora=rs_lora)
-                _replace_module(module, child_name, wrapped)
-                count += 1
-
-    # Freeze everything except LoRA params (and LN if you like)
-    for n, p in model.named_parameters():
-        if "lora_" in n or n.endswith(".lora_g"):
-            p.requires_grad = True
-        else:
-            # keep layer norms trainable if desired:
-            if ".layer_norm" in n or "layer_norm." in n:
-                p.requires_grad = False
-            else:
-                p.requires_grad = False
-
-    print(f"[LoRA] Injected into {count} linear modules; r={r}, alpha={alpha}, rs_lora={rs_lora}")
-    return model
-
-# LoRA config — tweak if you want
-LORA_CFG = {
-    "r": 8,
-    "alpha": 16,
-    "dropout": 0.05,
-    "target_modules": ("q_proj", "v_proj"),  # typical choice for Whisper
-    "rs_lora": True,                          # <— your request
-}
-
-add_lora_to_whisper(model, **LORA_CFG)
-
-# (Optional) quick check of trainable parameter count
-def count_trainable(m):
-    trainable = sum(p.numel() for p in m.parameters() if p.requires_grad)
-    total = sum(p.numel() for p in m.parameters())
-    print(f"Trainable params: {trainable:,} / {total:,} ({100*trainable/total:.4f}%)")
-count_trainable(model)
-# -------- end LoRA ----------
-
-# %%
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union
-
+# =============== COLLATOR (your original style, with safe masking) ===============
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
     decoder_start_token_id: int
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        # Prepare input features
+        # inputs
         input_features = [{"input_features": f["input_features"]} for f in features]
-        batch = processor.feature_extractor.pad(input_features, return_tensors="pt")
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
 
-        # Prepare labels
+        # labels (pad → mask → -100)
         label_features = [{"input_ids": f["labels"]} for f in features]
-        labels_batch = processor.tokenizer.pad(label_features, return_tensors="pt")
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+        labels = labels_batch["input_ids"]
+        lamask = labels_batch["attention_mask"]
 
-        # Cut BOS if present
+        # ignore PAD in loss
+        labels = labels.masked_fill(lamask.ne(1), -100)
+
+        # drop SOT/BOS if present at position 0
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
             labels = labels[:, 1:]
 
         batch["labels"] = labels
         return batch
 
-# %%
 data_collator = DataCollatorSpeechSeq2SeqWithPadding(
     processor=processor,
     decoder_start_token_id=model.config.decoder_start_token_id,
 )
 
-# %%
-import evaluate
+# =============== METRIC (WER) ===============
 metric = evaluate.load("wer")
 
 def compute_metrics(pred):
-    pred_ids = pred.predictions
-    label_ids = pred.label_ids
-
+    pred_ids = pred.predictions[0] if isinstance(pred.predictions, (tuple, list)) else pred.predictions
+    label_ids = torch.tensor(pred.label_ids)
     label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
-    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    label_ids = label_ids.cpu().numpy()
 
-    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    pred_str  = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    wer = 100.0 * metric.compute(predictions=pred_str, references=label_str)
     return {"wer": wer}
 
-# %%
-from transformers import Seq2SeqTrainingArguments
-
+# =============== TRAINING ARGS (close to your original) ===============
 training_args = Seq2SeqTrainingArguments(
-    output_dir="./",
+    output_dir="./whisper_peft_lora_out",
+    remove_unused_columns=False,     # keep "input_features"
+    label_names=["labels"],
     per_device_train_batch_size=4,
-    gradient_accumulation_steps=8,
-    learning_rate=5e-5,
-    warmup_steps=500,
-    max_steps=1000,
-    gradient_checkpointing=True,
-    fp16=True,
-    evaluation_strategy="steps",
     per_device_eval_batch_size=4,
-    predict_with_generate=True,
-    generation_max_length=225,
-    seed=91,
-    logging_steps=5,
+    gradient_accumulation_steps=8,   # like your earlier setup
+    learning_rate=1e-5,              # safe for LoRA
+    warmup_steps=200,
+    max_steps=1000,                   # you were using steps; keep it
+    evaluation_strategy="steps",
     eval_steps=5,
+    logging_steps=5,
     save_strategy="steps",
     save_total_limit=2,
-    report_to=["none"],
     load_best_model_at_end=True,
     metric_for_best_model="wer",
     greater_is_better=False,
-    push_to_hub=False,
+    predict_with_generate=True,
+    generation_max_length=225,       # you used 225
+    num_beams=1,
+    do_sample=False,
+    fp16=not eight_bit,
+    gradient_checkpointing=True,
     dataloader_num_workers=8,
     dataloader_prefetch_factor=2,
+    report_to=["none"],
 )
 
-# %%
-from transformers import Seq2SeqTrainer
-
+# =============== TRAINER (original flow) ===============
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
@@ -286,4 +218,40 @@ trainer = Seq2SeqTrainer(
     tokenizer=processor,
 )
 
+# =============== QUICK SMOKE TEST (sanity before long training) ===============
+if True:
+    from torch.utils.data import DataLoader
+    tmp_loader = DataLoader(vectorized_datasets["test"], batch_size=2, collate_fn=data_collator)
+    batch = next(iter(tmp_loader))
+    model.eval()
+    with torch.no_grad():
+        gen = model.generate(
+            input_features=batch["input_features"].to(model.device),
+            max_new_tokens=64,
+            do_sample=False,
+            num_beams=1,
+        )
+    pred = processor.tokenizer.batch_decode(gen, skip_special_tokens=True)
+    gold = processor.tokenizer.batch_decode(
+        batch["labels"].masked_fill(batch["labels"] == -100, processor.tokenizer.pad_token_id),
+        skip_special_tokens=True
+    )
+    print("SMOKE TEST — PRED:", pred)
+    print("SMOKE TEST — GOLD:", gold[:len(pred)])
+
+# =============== TRAIN & SAVE ===============
 trainer.train()
+
+# Save ONLY the LoRA adapter (PEFT best practice)
+adapter_dir = "/appdata/cortex/dev1/shob/ASR_models/asr_finetuning/whisper_peft_lora_adapter"
+model.save_pretrained(adapter_dir)
+processor.save_pretrained(adapter_dir)
+print(f"Saved LoRA adapter + processor to: {adapter_dir}")
+
+# (Optional) Merge adapter into base for export:
+# from peft import PeftModel
+# base = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+# merged = get_peft_model(base, lora_cfg)  # or PeftModel.from_pretrained(base, adapter_dir)
+# merged.load_adapter(adapter_dir)
+# merged = merged.merge_and_unload()
+# merged.save_pretrained("/path/to/merged_model")
