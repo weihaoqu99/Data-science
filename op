@@ -224,6 +224,12 @@ for k, v in study.best_trial.params.items():
 
 
 
+if trial.number == study.best_trial.number:
+    model.save_pretrained("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_optuna")
+    processor.save_pretrained("/appdata/cortex/dev1/shob/ASR_model/asr_finetuning/whisper_finetuning_optuna")
+
+
+
 from transformers import WhisperForConditionalGeneration
 
 best_model = WhisperForConditionalGeneration.from_pretrained(
