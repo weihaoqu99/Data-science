@@ -1,17 +1,20 @@
-# ===== LoRA ONLY (rsLoRA=True, r=64, alpha=32) =====
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+# ===== LoRA ONLY (r=64, alpha=32, rsLoRA=True) — version-safe =====
+from peft import LoraConfig, get_peft_model
 
-# If you're actually loading 8/4-bit, keep this; otherwise you may remove it.
-model = prepare_model_for_kbit_training(model)
-
-# memory helpers
+# keep your stability bits
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
-model.config.use_cache = False  # required when checkpointing
+model.config.use_cache = False  # needed with checkpointing
 
-# minimal, fast targets; rsLoRA ON; correct task type for Whisper
-lora_cfg = LoraConfig(
-    task_type="SEQ_2_SEQ_LM",
+# Try to use the enum when available; otherwise omit task_type
+_task_type = None
+try:
+    from peft import TaskType
+    _task_type = TaskType.SEQ_2_SEQ_LM
+except Exception:
+    _task_type = None  # older PEFT: LoraConfig has no task_type or expects default
+
+lora_kwargs = dict(
     r=64,
     lora_alpha=32,
     lora_dropout=0.05,
@@ -19,8 +22,10 @@ lora_cfg = LoraConfig(
     target_modules=["q_proj", "v_proj"],
     bias="none",
 )
+if _task_type is not None:
+    lora_kwargs["task_type"] = _task_type  # only set if supported
 
-# wrap with LoRA
+lora_cfg = LoraConfig(**lora_kwargs)
 model = get_peft_model(model, lora_cfg)
 
 # OPTIONAL speed tweak: train decoder adapters only
@@ -28,18 +33,15 @@ for n, p in model.named_parameters():
     if "lora_" in n and ".encoder." in n:
         p.requires_grad = False
 
-# ---------- SAFETY SHIM ----------
-# HuggingFace Trainer may pass `input_ids` to Whisper when LoRA-wrapped.
-# Whisper ASR expects `input_features` instead; just drop stray keys.
+# Safety shim: drop stray kwargs Trainer might pass to Whisper
 _base_forward = model.forward
 def _forward_whisper_shim(*args, **kwargs):
     kwargs.pop("input_ids", None)
     kwargs.pop("attention_mask", None)
     return _base_forward(*args, **kwargs)
 model.forward = _forward_whisper_shim
-# ---------- END SHIM ----------
 
-# (optional) see how many params will train
+# (optional) print summary
 try:
     model.print_trainable_parameters()
 except Exception:
