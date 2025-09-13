@@ -1,40 +1,48 @@
-# --- LoRA (r=64, alpha=32, rsLoRA=True) — decoder-only & fast ---
+# --- LoRA block (r=64, alpha=32, rsLoRA=True) + safe forward shim ---
 from peft import LoraConfig, get_peft_model
 
-# keep these here so training is stable; nothing else in your code is changed
+# keep these here for stability; nothing else in your code is changed
 processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
 model.config.pad_token_id = processor.tokenizer.pad_token_id
 if getattr(processor.tokenizer, "sot_token_id", None) is not None:
     model.config.decoder_start_token_id = processor.tokenizer.sot_token_id
 model.config.forced_decoder_ids = None
 model.config.suppress_tokens = []
-model.config.use_cache = False
+model.config.use_cache = False  # required with gradient checkpointing
 
-# memory/speed helpers (no k-bit prep since you didn't load 8/4-bit)
+# enable grads on inputs + checkpointing (memory friendly)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 
-# LoRA config (your ask): rsLoRA=True, r=64, alpha=32
+# your requested LoRA config
 lora_cfg = LoraConfig(
     task_type="SEQ_2_SEQ_LM",
     r=64,
     lora_alpha=32,
     lora_dropout=0.05,
-    use_rslora=True,                 # <-- rsLoRA ON
-    target_modules=["q_proj", "v_proj"],  # keep minimal targets for speed
+    use_rslora=True,                     # rsLoRA = True
+    target_modules=["q_proj", "v_proj"], # keep minimal targets for speed
     bias="none",
 )
 
-# wrap with LoRA
+# wrap base model with LoRA adapters
 model = get_peft_model(model, lora_cfg)
 
-# -------- speed tweak: train LoRA only on the DECODER --------
-# (Cuts adapter params ~in half vs encoder+decoder, so it runs faster.)
+# -------- speed tweak: train LoRA only on the DECODER (optional but fast) --------
 for name, param in model.named_parameters():
-    if "lora_" in name and ".encoder." in name:   # any LoRA params on encoder
+    if "lora_" in name and ".encoder." in name:   # freeze any encoder LoRA params
         param.requires_grad = False
 
-# Optional: view what will actually train
+# -------- forward shim: drop stray kwargs HF may pass (e.g., input_ids) --------
+# (Prevents: TypeError: forward() got an unexpected keyword argument 'input_ids')
+_base_forward = model.forward
+def _forward_shim(*args, **kwargs):
+    kwargs.pop("input_ids", None)        # Whisper expects input_features instead
+    kwargs.pop("attention_mask", None)   # not used for Whisper inputs
+    return _base_forward(*args, **kwargs)
+model.forward = _forward_shim
+
+# Optional: print trainable params summary
 try:
     model.print_trainable_parameters()
 except Exception:
