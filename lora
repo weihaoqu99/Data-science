@@ -2,12 +2,12 @@
 from peft import LoraConfig, get_peft_model
 import re
 
-# keeps your current memory settings
+# keep your memory settings
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 model.config.use_cache = False
 
-# build LoRA config (version-safe: no task_type string)
+# LoRA config
 lora_cfg = LoraConfig(
     r=64,
     lora_alpha=32,
@@ -16,35 +16,37 @@ lora_cfg = LoraConfig(
     target_modules=["q_proj", "v_proj"],
     bias="none",
 )
-
-# apply LoRA
 model = get_peft_model(model, lora_cfg)
 
 # -------- SPEED-UP: train LoRA only on the LAST K decoder layers ----------
-K = 6  # <-- tweak if you want even faster (e.g., 4) or a bit slower/better (e.g., 8)
+K = 6  # change to 4 for even faster, 8 for slower but better quality
 
-# figure out number of decoder layers across HF/PEFT variants
-try:
-    num_layers = len(model.base_model.model.decoder.layers)
-except Exception:
-    num_layers = len(model.model.decoder.layers)
-keep_from = max(0, num_layers - K)
+# Whisper stores decoder here:
+decoder_layers = None
+if hasattr(model, "model") and hasattr(model.model, "decoder"):
+    decoder_layers = model.model.decoder.layers
+elif hasattr(model, "base_model") and hasattr(model.base_model.model, "decoder"):
+    decoder_layers = model.base_model.model.decoder.layers
 
-for name, p in model.named_parameters():
-    if "lora_" not in name:
-        continue
-    # never train encoder LoRA
-    if ".encoder." in name:
-        p.requires_grad = False
-        continue
-    # freeze decoder LoRA below the keep range
-    m = re.search(r"decoder\.layers\.(\d+)\.", name)
-    if m:
-        layer_idx = int(m.group(1))
-        if layer_idx < keep_from:
+if decoder_layers is not None:
+    num_layers = len(decoder_layers)
+    keep_from = max(0, num_layers - K)
+
+    for name, p in model.named_parameters():
+        if "lora_" not in name:
+            continue
+        # freeze encoder
+        if ".encoder." in name:
             p.requires_grad = False
+            continue
+        # freeze lower decoder layers
+        m = re.search(r"decoder\.layers\.(\d+)\.", name)
+        if m:
+            layer_idx = int(m.group(1))
+            if layer_idx < keep_from:
+                p.requires_grad = False
 
-# optional: see how many params will train
+# optional: print how many params will train
 try:
     model.print_trainable_parameters()
 except Exception:
