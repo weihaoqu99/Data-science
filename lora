@@ -1,20 +1,14 @@
-# ===== LoRA ONLY (r=64, alpha=32, rsLoRA=True) — version-safe =====
+# ===== LoRA ONLY: r=64, alpha=32, rsLoRA=True, FAST (top-k decoder layers) =====
 from peft import LoraConfig, get_peft_model
+import re
 
-# keep your stability bits
+# keeps your current memory settings
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
-model.config.use_cache = False  # needed with checkpointing
+model.config.use_cache = False
 
-# Try to use the enum when available; otherwise omit task_type
-_task_type = None
-try:
-    from peft import TaskType
-    _task_type = TaskType.SEQ_2_SEQ_LM
-except Exception:
-    _task_type = None  # older PEFT: LoraConfig has no task_type or expects default
-
-lora_kwargs = dict(
+# build LoRA config (version-safe: no task_type string)
+lora_cfg = LoraConfig(
     r=64,
     lora_alpha=32,
     lora_dropout=0.05,
@@ -22,26 +16,35 @@ lora_kwargs = dict(
     target_modules=["q_proj", "v_proj"],
     bias="none",
 )
-if _task_type is not None:
-    lora_kwargs["task_type"] = _task_type  # only set if supported
 
-lora_cfg = LoraConfig(**lora_kwargs)
+# apply LoRA
 model = get_peft_model(model, lora_cfg)
 
-# OPTIONAL speed tweak: train decoder adapters only
-for n, p in model.named_parameters():
-    if "lora_" in n and ".encoder." in n:
+# -------- SPEED-UP: train LoRA only on the LAST K decoder layers ----------
+K = 6  # <-- tweak if you want even faster (e.g., 4) or a bit slower/better (e.g., 8)
+
+# figure out number of decoder layers across HF/PEFT variants
+try:
+    num_layers = len(model.base_model.model.decoder.layers)
+except Exception:
+    num_layers = len(model.model.decoder.layers)
+keep_from = max(0, num_layers - K)
+
+for name, p in model.named_parameters():
+    if "lora_" not in name:
+        continue
+    # never train encoder LoRA
+    if ".encoder." in name:
         p.requires_grad = False
+        continue
+    # freeze decoder LoRA below the keep range
+    m = re.search(r"decoder\.layers\.(\d+)\.", name)
+    if m:
+        layer_idx = int(m.group(1))
+        if layer_idx < keep_from:
+            p.requires_grad = False
 
-# Safety shim: drop stray kwargs Trainer might pass to Whisper
-_base_forward = model.forward
-def _forward_whisper_shim(*args, **kwargs):
-    kwargs.pop("input_ids", None)
-    kwargs.pop("attention_mask", None)
-    return _base_forward(*args, **kwargs)
-model.forward = _forward_whisper_shim
-
-# (optional) print summary
+# optional: see how many params will train
 try:
     model.print_trainable_parameters()
 except Exception:
