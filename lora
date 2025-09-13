@@ -1,20 +1,47 @@
+# ===== LoRA ONLY (rsLoRA=True, r=64, alpha=32) =====
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# prepare model for LoRA training
+# If you're actually loading 8/4-bit, keep this; otherwise you may remove it.
 model = prepare_model_for_kbit_training(model)
+
+# memory helpers
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
+model.config.use_cache = False  # required when checkpointing
 
-# LoRA config (RS-LoRA enabled)
+# minimal, fast targets; rsLoRA ON; correct task type for Whisper
 lora_cfg = LoraConfig(
+    task_type="SEQ_2_SEQ_LM",
     r=64,
     lora_alpha=32,
     lora_dropout=0.05,
+    use_rslora=True,
     target_modules=["q_proj", "v_proj"],
     bias="none",
-    task_type="SEQ_2_SEQ_LM",   # required for Whisper
-    use_rslora=True             # enable RS-LoRA
 )
 
-# apply LoRA
+# wrap with LoRA
 model = get_peft_model(model, lora_cfg)
+
+# OPTIONAL speed tweak: train decoder adapters only
+for n, p in model.named_parameters():
+    if "lora_" in n and ".encoder." in n:
+        p.requires_grad = False
+
+# ---------- SAFETY SHIM ----------
+# HuggingFace Trainer may pass `input_ids` to Whisper when LoRA-wrapped.
+# Whisper ASR expects `input_features` instead; just drop stray keys.
+_base_forward = model.forward
+def _forward_whisper_shim(*args, **kwargs):
+    kwargs.pop("input_ids", None)
+    kwargs.pop("attention_mask", None)
+    return _base_forward(*args, **kwargs)
+model.forward = _forward_whisper_shim
+# ---------- END SHIM ----------
+
+# (optional) see how many params will train
+try:
+    model.print_trainable_parameters()
+except Exception:
+    pass
+# ===== END LoRA ONLY =====
