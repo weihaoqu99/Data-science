@@ -1,40 +1,20 @@
-# --- LoRA: rsLoRA=True, r=64, alpha=32 (fast + correct for Whisper) ---
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
-# Keep these small config lines here for stability
-processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
-model.config.pad_token_id = processor.tokenizer.pad_token_id
-if getattr(processor.tokenizer, "sot_token_id", None) is not None:
-    model.config.decoder_start_token_id = processor.tokenizer.sot_token_id
-model.config.forced_decoder_ids = None
-model.config.suppress_tokens = []
-model.config.use_cache = False  # required with gradient checkpointing
-
-# No k-bit prep (you didn't load 8/4-bit) → avoids slowdown
+# prepare model for LoRA training
+model = prepare_model_for_kbit_training(model)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
 
-# >>> IMPORTANT: task_type MUST be SEQ_2_SEQ_LM for Whisper
-#     (prevents Trainer from trying to pass `input_ids` to forward)
+# LoRA config (RS-LoRA enabled)
 lora_cfg = LoraConfig(
-    task_type="SEQ_2_SEQ_LM",
-    r=64,                 # your requested rank
-    lora_alpha=32,        # your requested alpha
+    r=64,
+    lora_alpha=32,
     lora_dropout=0.05,
-    use_rslora=True,      # rsLoRA = True
-    target_modules=["q_proj", "v_proj"],  # minimal targets = faster
+    target_modules=["q_proj", "v_proj"],
     bias="none",
+    task_type="SEQ_2_SEQ_LM",   # required for Whisper
+    use_rslora=True             # enable RS-LoRA
 )
 
+# apply LoRA
 model = get_peft_model(model, lora_cfg)
-
-# Speed tweak: train LoRA only on the DECODER (freeze any encoder LoRA)
-for name, p in model.named_parameters():
-    if "lora_" in name and ".encoder." in name:
-        p.requires_grad = False
-
-# Optional: print summary of trainable params
-try:
-    model.print_trainable_parameters()
-except Exception:
-    pass
