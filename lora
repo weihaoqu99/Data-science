@@ -1,54 +1,42 @@
-# ===== LoRA ONLY: r=64, alpha=32, rsLoRA=True, FAST (top-k decoder layers) =====
-from peft import LoraConfig, get_peft_model
-import re
+# --- LoRA (RS-LoRA True, r=64, alpha=32) -----------------------
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    PeftModel,
+    TaskType,
+)
 
-# keep your memory settings
+# (optional but safe even if you’re not using 8-bit) – keeps layer norms in fp32, etc.
+model = prepare_model_for_kbit_training(model)
+
+# your notebook already uses this style; keep it
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
-model.config.use_cache = False
 
-# LoRA config
-lora_cfg = LoraConfig(
-    r=64,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    use_rslora=True,
-    target_modules=["q_proj", "v_proj"],
-    bias="none",
-)
-model = get_peft_model(model, lora_cfg)
-
-# -------- SPEED-UP: train LoRA only on the LAST K decoder layers ----------
-K = 6  # change to 4 for even faster, 8 for slower but better quality
-
-# Whisper stores decoder here:
-decoder_layers = None
-if hasattr(model, "model") and hasattr(model.model, "decoder"):
-    decoder_layers = model.model.decoder.layers
-elif hasattr(model, "base_model") and hasattr(model.base_model.model, "decoder"):
-    decoder_layers = model.base_model.model.decoder.layers
-
-if decoder_layers is not None:
-    num_layers = len(decoder_layers)
-    keep_from = max(0, num_layers - K)
-
-    for name, p in model.named_parameters():
-        if "lora_" not in name:
-            continue
-        # freeze encoder
-        if ".encoder." in name:
-            p.requires_grad = False
-            continue
-        # freeze lower decoder layers
-        m = re.search(r"decoder\.layers\.(\d+)\.", name)
-        if m:
-            layer_idx = int(m.group(1))
-            if layer_idx < keep_from:
-                p.requires_grad = False
-
-# optional: print how many params will train
+# Prefer the enum for compatibility with older PEFTs (avoids the "task_type" error)
 try:
-    model.print_trainable_parameters()
-except Exception:
-    pass
-# ===== END LoRA ONLY =====
+    lora_cfg = LoraConfig(
+        r=64,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        use_rslora=True,               # RS-LoRA = True
+    )
+except TypeError:
+    # If your installed PEFT is older and doesn't know `use_rslora`,
+    # fall back to standard LoRA but keep r/alpha the same.
+    lora_cfg = LoraConfig(
+        r=64,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+        task_type=TaskType.SEQ_2_SEQ_LM,
+    )
+
+model = get_peft_model(model, lora_cfg)
+model.print_trainable_parameters()  # sanity check: only LoRA params should be trainable
+# --------------------------------------------------------------
