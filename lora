@@ -1,3 +1,52 @@
+
+What is an epoch?
+	•	Epoch = one full pass through the entire training dataset.
+	•	If you have 587 training samples, then one epoch means the model saw all 587 samples once.
+
+⸻
+
+2. How many steps = 1 epoch in your setup?
+
+Your effective batch size =
+per_device_train_batch_size × gradient_accumulation_steps × num_devices
+	•	per device batch size = 4
+	•	gradient accumulation = 8
+	•	GPUs = 1
+
+👉 Effective batch = 4 × 8 × 1 = 32 samples per optimizer update (global step).
+
+Dataset size = 587 samples.
+
+Steps per epoch = 587 / 32 ≈ 18.34 → about 18 optimizer steps = 1 epoch.
+How many epochs did your run cover?
+
+You told Trainer to run for max_steps=1000.
+
+Epochs covered = 1000 / 18 ≈ 55.5
+
+That matches your log, which showed:
+
+This means by step 1000, your model had seen the dataset about 54 full times and was partway through the 55th.
+
+⸻
+
+4. Why is this important?
+	•	Epoch count controls training exposure.
+Too few epochs → underfitting.
+Too many epochs → overfitting / wasted compute.
+	•	Because your dataset is small (587 rows), running 50+ epochs is usually too much unless you use strong regularization.
+
+⸻
+
+✅ Summary:
+	•	1 epoch = ~18 steps in your setup.
+	•	Your run went for 1000 steps = ~55 epochs.
+	•	That’s why your log shows epoch ~54.4 at the end.
+
+
+
+
+
 target_modules=["q_proj","k_proj","v_proj","out_proj"],
 
 
