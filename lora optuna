@@ -1,27 +1,10 @@
-# =========================================================
-# Full ASR fine-tune script (original-style) + Optuna LoRA search (non-invasive)
-# =========================================================
+# ============================================
+# Optuna search to find best LoRA settings
+# (keeps your original code unchanged)
+# ============================================
+import gc, os, json, math
+import optuna
 
-# ---- environment -------------------------------------------------------------
-import os, glob, gc, json, math
-from dataclasses import dataclass
-from typing import Any, Dict, List, Union
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
-# ---- core libs ----------------------------------------------------------------
-import torch
-import evaluate
-import numpy as np
-from datasets import Dataset, Audio
-from transformers import (
-    WhisperProcessor,
-    WhisperForConditionalGeneration,
-    Seq2SeqTrainingArguments,
-    Seq2SeqTrainer,
-)
-
-# ---- PEFT / LoRA --------------------------------------------------------------
 from peft import (
     LoraConfig,
     get_peft_model,
@@ -29,140 +12,29 @@ from peft import (
     TaskType,
 )
 
-# ---- Optuna -------------------------------------------------------------------
-import optuna
-from datetime import datetime
-
-# =========================================================
-#                 Original-style dataset setup
-# =========================================================
-
-AUDIO_GLOB = "/appdata/cortex/dev1/origAudio/*.mp3"
-# If you switch between full and distilled, change only this:
-whisper_loc = "/appdata/cortex/dev1/whisper_copy/distil-large-v2"
-# whisper_loc = "/appdata/cortex/dev1/aptaiModels/whisper-large-v2"
-
-audio_files = glob.glob(AUDIO_GLOB)
-
-def retrieve_transcript(input_str: str) -> str:
-    # Your cleaning rules (kept as-is; extend if you have more)
-    tmp = input_str[input_str.find("-")+1:-4]  # strip out track no. and .mp3
-    tmp = tmp.replace("_", " ")
-    tmp = tmp.replace(".", " ")
-    tmp = tmp.replace("shell", "she'll")
-    tmp = tmp.replace("dont", "don't")
-    tmp = tmp.capitalize()
-    tmp = tmp.replace("i ", "I ")
-    return tmp
-
-transcripts = [retrieve_transcript(s) for s in audio_files]
-num_samples = len(audio_files)
-
-raw_datasets = Dataset.from_dict({
-    "audio": audio_files[:num_samples],
-    "sentence": transcripts[:num_samples]
-}).cast_column("audio", Audio(sampling_rate=16_000))
-
-raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
-
-# =========================================================
-#                 Processor / feature pipeline
-# =========================================================
-processor = WhisperProcessor.from_pretrained(whisper_loc, language="en", task="transcribe")
-
-# Whisper expects 16k mono float inputs and label ids from tokenizer
-def prepare_batch(batch):
-    # load & resample handled by datasets.Audio cast; we just extract arrays / text
-    audio = batch["audio"]
-    batch["input_features"] = processor.feature_extractor(
-        audio["array"], sampling_rate=audio["sampling_rate"]
-    ).input_features[0]
-
-    # labels (text -> token ids)
-    with processor.as_target_processor():
-        labels = processor.tokenizer(batch["sentence"])
-    batch["labels"] = labels["input_ids"]
-    return batch
-
-vectorized_datasets = raw_datasets.map(
-    prepare_batch,
-    remove_columns=raw_datasets["train"].column_names,
-    num_proc=1
-)
-
-# =========================================================
-#                    Data collator (unchanged style)
-# =========================================================
-@dataclass
-class DataCollatorSpeechSeq2SeqWithPadding:
-    processor: WhisperProcessor
-    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
-        input_features = [{"input_features": f["input_features"]} for f in features]
-        label_features = [{"input_ids": f["labels"]} for f in features]
-
-        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
-        with self.processor.as_target_processor():
-            labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
-
-        # Replace padding with -100 to ignore in loss
-        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
-        batch["labels"] = labels
-        return batch
-
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
-
-# =========================================================
-#                       Metrics (WER)
-# =========================================================
-wer_metric = evaluate.load("wer")
-
-def compute_metrics(eval_pred):
-    preds, labels = eval_pred
-    # replace -100 in labels
-    labels = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
-    # decode
-    pred_str = processor.tokenizer.batch_decode(preds, skip_special_tokens=True)
-    label_str = processor.tokenizer.batch_decode(labels, skip_special_tokens=True)
-    wer = wer_metric.compute(predictions=pred_str, references=label_str)
-    return {"wer": wer, "eval_wer": wer}
-
-# =========================================================
-#                      Base model load
-# =========================================================
-model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-
-# Ensure decoder prompt ids for English transcribe (kept common)
-forced_ids = processor.get_decoder_prompt_ids(language="en", task="transcribe")
-model.config.forced_decoder_ids = forced_ids
-model.config.suppress_tokens = []
-
-# Safe k-bit prep (no-op if not using 8-bit); and training efficiency
-model = prepare_model_for_kbit_training(model)
-model.gradient_checkpointing_enable()
-model.enable_input_require_grads()
-
-# =========================================================
-#                    Optuna: LoRA search (ADD-ON)
-#   - Runs short trials on small slices to find best LoRA params
-#   - Applies best LoRA to *your* `model`
-# =========================================================
-
-# fast tuning subsets (kept small to be quick)
+# --- tiny, fast slices for the search (so it doesn't take forever)
 TUNE_TRAIN_SAMPLES = min(200, len(vectorized_datasets["train"]))
 TUNE_EVAL_SAMPLES  = min(100, len(vectorized_datasets["test"]))
 tune_train = vectorized_datasets["train"].select(range(TUNE_TRAIN_SAMPLES))
 tune_eval  = vectorized_datasets["test"].select(range(TUNE_EVAL_SAMPLES))
 
+# If you want to reload a fresh base model for each trial (recommended),
+# define this using the same 'whisper_loc' you already use:
 def _fresh_base():
     m = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+    # Safe even if you aren't using 8-bit; keeps norms in fp32, etc.
     m = prepare_model_for_kbit_training(m)
     m.gradient_checkpointing_enable()
     m.enable_input_require_grads()
-    m.config.forced_decoder_ids = forced_ids
+    # keep your same config flags:
     m.config.suppress_tokens = []
+    m.config.use_cache = False
+    m.config.language = "english"
+    m.config.task = "transcribe"
     return m
 
 def objective(trial: optuna.Trial) -> float:
+    # --- search space (adjust/expand as you like)
     r           = trial.suggest_categorical("r", [16, 32, 64])
     alpha       = trial.suggest_categorical("alpha", [16, 32, 64])
     dropout     = trial.suggest_float("dropout", 0.01, 0.15, step=0.02)
@@ -173,6 +45,8 @@ def objective(trial: optuna.Trial) -> float:
     )
 
     temp_model = _fresh_base()
+
+    # Build LoRA config (RS-LoRA if your PEFT supports it)
     try:
         lcfg = LoraConfig(
             r=r,
@@ -184,6 +58,7 @@ def objective(trial: optuna.Trial) -> float:
             use_rslora=use_rslora,
         )
     except TypeError:
+        # Older PEFT fallback (no RS-LoRA flag)
         lcfg = LoraConfig(
             r=r,
             lora_alpha=alpha,
@@ -192,9 +67,11 @@ def objective(trial: optuna.Trial) -> float:
             bias="none",
             task_type=TaskType.SEQ_2_SEQ_LM,
         )
+
     temp_model = get_peft_model(temp_model, lcfg)
 
-    args = Seq2SeqTrainingArguments(
+    # Short, comparable run so Optuna can rank trials
+    trial_args = Seq2SeqTrainingArguments(
         output_dir=f"./optuna_trial_{trial.number}",
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
@@ -208,117 +85,83 @@ def objective(trial: optuna.Trial) -> float:
         generation_max_length=225,
         fp16=torch.cuda.is_available(),
         report_to=["none"],
-        dataloader_num_workers=0,
+        dataloader_num_workers=0,  # avoid multiprocessing overhead for tiny runs
     )
 
-    trainer = Seq2SeqTrainer(
+    trial_trainer = Seq2SeqTrainer(
         model=temp_model,
-        args=args,
+        args=trial_args,
         train_dataset=tune_train,
         eval_dataset=tune_eval,
         data_collator=data_collator,
         tokenizer=processor,
-        compute_metrics=compute_metrics,
+        compute_metrics=compute_metrics,  # your WER
     )
 
-    trainer.train()
-    metrics = trainer.evaluate()
-    value = float(metrics.get("eval_wer", math.inf))
+    trial_trainer.train()
+    metrics = trial_trainer.evaluate()
+    # Your compute_metrics returns {"wer": …}; Trainer wraps it as "eval_wer"
+    wer = float(metrics.get("eval_wer", math.inf))
 
-    # cleanup between trials
-    del trainer, temp_model
+    # Cleanup GPU/CPU between trials
+    del trial_trainer, temp_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    trial.report(value, step=0)
+    trial.report(wer, step=0)
     if trial.should_prune():
         raise optuna.TrialPruned()
+    return wer
 
-    return value
-
-study_name = f"lora_tune_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-sampler = optuna.samplers.TPESampler(n_startup_trials=4, multivariate=True)
-pruner  = optuna.pruners.MedianPruner(n_startup_trials=4, n_warmup_steps=0)
-study = optuna.create_study(direction="minimize", sampler=sampler, pruner=pruner, study_name=study_name)
+# Create and run the study
+study = optuna.create_study(
+    direction="minimize",
+    sampler=optuna.samplers.TPESampler(n_startup_trials=4, multivariate=True),
+    pruner=optuna.pruners.MedianPruner(n_startup_trials=4),
+)
 study.optimize(objective, n_trials=10, show_progress_bar=False)
 
-print(f"[Optuna] Best trial: {study.best_trial.number}")
-print(f"[Optuna] Best params: {study.best_trial.params}")
-print(f"[Optuna] Best WER: {study.best_trial.value}")
+print("[Optuna] Best trial:", study.best_trial.number)
+print("[Optuna] Best params:", study.best_trial.params)
+print("[Optuna] Best WER:", study.best_trial.value)
 
 os.makedirs("./optuna_results", exist_ok=True)
-with open(f"./optuna_results/{study_name}.json", "w") as f:
-    json.dump({
-        "best_trial": study.best_trial.number,
-        "best_params": study.best_trial.params,
-        "best_value": study.best_trial.value
-    }, f, indent=2)
+with open("./optuna_results/best_lora_params.json", "w") as f:
+    json.dump(study.best_trial.params, f, indent=2)
 
-# ---- Apply best LoRA to YOUR current `model` (for full training) -------------
-best = study.best_trial.params
-best_cfg_kwargs = dict(
-    r=best["r"],
-    lora_alpha=best["alpha"],
-    lora_dropout=best["dropout"],
-    target_modules=best["target_modules"],
-    bias="none",
-    task_type=TaskType.SEQ_2_SEQ_LM,
-)
-try:
-    best_cfg = LoraConfig(**best_cfg_kwargs, use_rslora=best.get("use_rslora", True))
-except TypeError:
-    best_cfg = LoraConfig(**best_cfg_kwargs)
-
-# (re)ensure prep (safe) and attach LoRA on your loaded `model`
+# ------------------------------------------------------------
+# Apply BEST LoRA to YOUR existing `model` for the real training
+# (No other parts of your script are changed)
+# ------------------------------------------------------------
+# Ensure prep (idempotent/safe to call again)
 model = prepare_model_for_kbit_training(model)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
+
+best = study.best_trial.params
+try:
+    best_cfg = LoraConfig(
+        r=best["r"],
+        lora_alpha=best["alpha"],
+        lora_dropout=best["dropout"],
+        target_modules=best["target_modules"],
+        bias="none",
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        use_rslora=best.get("use_rslora", True),
+    )
+except TypeError:
+    best_cfg = LoraConfig(
+        r=best["r"],
+        lora_alpha=best["alpha"],
+        lora_dropout=best["dropout"],
+        target_modules=best["target_modules"],
+        bias="none",
+        task_type=TaskType.SEQ_2_SEQ_LM,
+    )
+
 model = get_peft_model(model, best_cfg)
-model.print_trainable_parameters()
-
-# =========================================================
-#                Full training with best LoRA
-# =========================================================
-train_args = Seq2SeqTrainingArguments(
-    output_dir="./whisper_lora_out",
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=4,
-    gradient_accumulation_steps=1,
-    num_train_epochs=3,                # adjust for your run
-    learning_rate=1e-4,                # typical for LoRA on Whisper
-    warmup_steps=100,
-    fp16=torch.cuda.is_available(),
-    logging_strategy="steps",
-    logging_steps=50,
-    evaluation_strategy="steps",
-    eval_steps=200,
-    save_strategy="steps",
-    save_steps=400,
-    predict_with_generate=True,
-    generation_max_length=225,
-    report_to=["none"],                # keep clean unless you use WandB etc.
-)
-
-trainer = Seq2SeqTrainer(
-    model=model,
-    args=train_args,
-    train_dataset=vectorized_datasets["train"],
-    eval_dataset=vectorized_datasets["test"],
-    data_collator=data_collator,
-    tokenizer=processor,
-    compute_metrics=compute_metrics,
-)
-
-trainer.train()
-
-# ---- Final evaluation ---------------------------------------------------------
-final_metrics = trainer.evaluate()
-print("Final WER:", final_metrics.get("eval_wer"))
-
-# ---- Save ---------------------------------------------------------------------
-save_dir = "./whisper_lora_final"
-os.makedirs(save_dir, exist_ok=True)
-trainer.save_model(save_dir)                 # saves adapter if LoRA
-processor.save_pretrained(save_dir)
-print(f"Saved to {save_dir}")
+model.print_trainable_parameters()  # sanity check: only LoRA params trainable
+# ============================================
+# End Optuna block — continue to your Trainer()
+# ============================================
