@@ -155,9 +155,8 @@ def compute_metrics(pred):
     return {"wer": wer}  # Trainer exposes as "eval_wer"
 
 # ===================================================================
-# ============ ADD-ON 1: one-cell hotfix (no edits elsewhere) =======
-# Patches Whisper + PEFT forward so stray kwargs (e.g., input_ids)
-# are ignored. This fixes the error in your screenshot.
+# ADD-ON 1: One-cell forward hotfix (no edits to your cells)
+# Ignores unexpected kwargs (e.g., input_ids) at Whisper/PEFT boundary
 # ===================================================================
 from transformers.models.whisper.modeling_whisper import WhisperForConditionalGeneration as _WhisperFG
 from peft.peft_model import PeftModel as _PeftModel
@@ -195,19 +194,16 @@ if not hasattr(_PeftModel, "_orig_forward"):
 print("✅ Forward hotfix installed (Whisper + PEFT).")
 
 # ===================================================================
-# ============ ADD-ON 2: Optuna + LoRA (includes 128) ===============
-# Searches LoRA r/alpha/dropout/targets/RS flag on tiny slices,
-# then attaches BEST LoRA to your current `model`.
+# ADD-ON 2: Optuna + LoRA (includes r/alpha=128) — corrected
+# Uses your already-vectorized subsets inside each trial
 # ===================================================================
 import gc, json, math, optuna
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 
-# Tiny subsets for search
+# Small, quick slice sizes for tuning
 TUNE_TRAIN_SAMPLES = min(200, len(vectorized_datasets["train"]))
 TUNE_EVAL_SAMPLES  = min(100, len(vectorized_datasets["test"]))
-tune_train = vectorized_datasets["train"].select(range(TUNE_TRAIN_SAMPLES))
-tune_eval  = vectorized_datasets["test"].select(range(TUNE_EVAL_SAMPLES))
 
 def _fresh_base():
     m = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
@@ -218,18 +214,20 @@ def _fresh_base():
     m.config.use_cache = False
     m.config.language = "english"
     m.config.task = "transcribe"
-    return m  # hotfix is class-level, so new instances are already patched
+    return m  # (forward is already monkey-patched class-wide)
 
 def objective(trial: optuna.Trial) -> float:
-    # >>> includes 128 for r and alpha <<<
+    # >>> includes 128 values <<<
     r           = trial.suggest_categorical("r", [16, 32, 64, 128])
     alpha       = trial.suggest_categorical("alpha", [16, 32, 64, 128])
     dropout     = trial.suggest_float("dropout", 0.01, 0.15, step=0.02)
     use_rslora  = trial.suggest_categorical("use_rslora", [True, False])
-    target_mods = trial.suggest_categorical("target_modules",
-                                            [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]])
+    target_mods = trial.suggest_categorical(
+        "target_modules", [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]]
+    )
 
     temp_model = _fresh_base()
+
     try:
         lcfg = LoraConfig(
             r=r, lora_alpha=alpha, lora_dropout=dropout,
@@ -243,6 +241,10 @@ def objective(trial: optuna.Trial) -> float:
             task_type=TaskType.SEQ_2_SEQ_LM,
         )
     temp_model = get_peft_model(temp_model, lcfg)
+
+    # === IMPORTANT: use ALREADY-VECTORIZED subsets so "input_features" exists ===
+    trial_train = vectorized_datasets["train"].select(range(TUNE_TRAIN_SAMPLES))
+    trial_eval  = vectorized_datasets["test"].select(range(TUNE_EVAL_SAMPLES))
 
     trial_args = Seq2SeqTrainingArguments(
         output_dir=f"./optuna_trial_{trial.number}",
@@ -264,8 +266,8 @@ def objective(trial: optuna.Trial) -> float:
     trial_trainer = Seq2SeqTrainer(
         model=temp_model,
         args=trial_args,
-        train_dataset=tune_train,
-        eval_dataset=tune_eval,
+        train_dataset=trial_train,
+        eval_dataset=trial_eval,
         data_collator=data_collator,
         tokenizer=processor,
         compute_metrics=compute_metrics,
