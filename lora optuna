@@ -155,7 +155,7 @@ def compute_metrics(pred):
     return {"wer": wer}  # Trainer exposes as "eval_wer"
 
 # ===================================================================
-# ADD-ON 1: One-cell forward hotfix (no edits to your cells)
+# ADD-ON 1: One-cell forward hotfix (optional but safe)
 # Ignores unexpected kwargs (e.g., input_ids) at Whisper/PEFT boundary
 # ===================================================================
 from transformers.models.whisper.modeling_whisper import WhisperForConditionalGeneration as _WhisperFG
@@ -261,6 +261,10 @@ def objective(trial: optuna.Trial) -> float:
         fp16=torch.cuda.is_available(),
         report_to=["none"],
         dataloader_num_workers=0,
+
+        # keep columns intact for speech batches
+        remove_unused_columns=False,
+        label_names=["labels"],
     )
 
     trial_trainer = Seq2SeqTrainer(
