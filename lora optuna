@@ -123,7 +123,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
 
         # ignore pad in loss
-        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+        labels = labels_batch["input_ids"].masked_fill(labels_batch["attention_mask"].ne(1), -100)
 
         # drop BOS if already prepended
         if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
@@ -155,81 +155,79 @@ def compute_metrics(pred):
     return {"wer": wer}  # Trainer exposes as "eval_wer"
 
 # ===================================================================
-# ====================  ADD-ON 1: NO-TOUCH FIX SHIM  =================
-# (Does NOT edit your cells. Wraps the model so it ignores stray kwargs
-# like `input_ids` that caused your error.)
+# ============ ADD-ON 1: one-cell hotfix (no edits elsewhere) =======
+# Patches Whisper + PEFT forward so stray kwargs (e.g., input_ids)
+# are ignored. This fixes the error in your screenshot.
 # ===================================================================
-import types
+from transformers.models.whisper.modeling_whisper import WhisperForConditionalGeneration as _WhisperFG
+from peft.peft_model import PeftModel as _PeftModel
 
-class ForwardKwargSanitizer(torch.nn.Module):
-    def __init__(self, base):
-        super().__init__()
-        self.base = base
-        self._allowed = {
-            "input_features", "labels",
-            "decoder_input_ids", "decoder_attention_mask",
-            "return_dict", "output_attentions", "output_hidden_states", "use_cache",
+if not hasattr(_WhisperFG, "_orig_forward"):
+    _WhisperFG._orig_forward = _WhisperFG.forward
+    def _whisper_forward(self, *args, **kwargs):
+        allowed = {
+            "input_features","labels",
+            "decoder_input_ids","decoder_attention_mask",
+            "output_attentions","output_hidden_states",
+            "return_dict","use_cache"
         }
-    def forward(self, *args, **kwargs):
-        if kwargs:
-            kwargs = {k: v for k, v in kwargs.items() if k in self._allowed}
-        return self.base(*args, **kwargs)
+        for k in list(kwargs.keys()):
+            if k not in allowed:
+                kwargs.pop(k, None)
+        return _WhisperFG._orig_forward(self, *args, **kwargs)
+    _WhisperFG.forward = _whisper_forward
 
-# Wrap YOUR model (no other code touched)
-model = ForwardKwargSanitizer(model)
+if not hasattr(_PeftModel, "_orig_forward"):
+    _PeftModel._orig_forward = _PeftModel.forward
+    def _peft_forward(self, *args, **kwargs):
+        allowed = {
+            "input_features","labels",
+            "decoder_input_ids","decoder_attention_mask",
+            "output_attentions","output_hidden_states",
+            "return_dict","use_cache"
+        }
+        for k in list(kwargs.keys()):
+            if k not in allowed:
+                kwargs.pop(k, None)
+        return _PeftModel._orig_forward(self, *args, **kwargs)
+    _PeftModel.forward = _peft_forward
 
-# Provide a fresh-wrapped base maker for Optuna trials (so you don't edit that cell)
-def make_fresh_whisper_base_for_optuna():
-    from transformers import WhisperForConditionalGeneration
-    from peft import prepare_model_for_kbit_training
-    m = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-    m = prepare_model_for_kbit_training(m)
-    m.gradient_checkpointing_enable()
-    m.enable_input_require_grads()
-    m.config.suppress_tokens = []
-    m.config.use_cache = False
-    m.config.language = "english"
-    m.config.task = "transcribe"
-    return ForwardKwargSanitizer(m)
-
-# If an Optuna block defines `_fresh_base()`, override it here dynamically
-if "_fresh_base" in globals() and isinstance(globals()["_fresh_base"], types.FunctionType):
-    globals()["_fresh_base"] = make_fresh_whisper_base_for_optuna
+print("✅ Forward hotfix installed (Whisper + PEFT).")
 
 # ===================================================================
-# ====================  ADD-ON 2: OPTUNA + LoRA  ====================
-# (Finds best LoRA params and attaches them to YOUR model.
-#  No edits to your original cells.)
+# ============ ADD-ON 2: Optuna + LoRA (includes 128) ===============
+# Searches LoRA r/alpha/dropout/targets/RS flag on tiny slices,
+# then attaches BEST LoRA to your current `model`.
 # ===================================================================
 import gc, json, math, optuna
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
 from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
 
-# Small, quick slices
+# Tiny subsets for search
 TUNE_TRAIN_SAMPLES = min(200, len(vectorized_datasets["train"]))
 TUNE_EVAL_SAMPLES  = min(100, len(vectorized_datasets["test"]))
 tune_train = vectorized_datasets["train"].select(range(TUNE_TRAIN_SAMPLES))
 tune_eval  = vectorized_datasets["test"].select(range(TUNE_EVAL_SAMPLES))
 
-# Fallback fresh base (will be swapped by the shim override above)
 def _fresh_base():
-    from transformers import WhisperForConditionalGeneration
     m = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-    m = prepare_model_for_kbit_training(m)
+    m = prepare_model_for_kbit_training(m)   # safe even if not using 8-bit
     m.gradient_checkpointing_enable()
     m.enable_input_require_grads()
     m.config.suppress_tokens = []
     m.config.use_cache = False
     m.config.language = "english"
     m.config.task = "transcribe"
-    return ForwardKwargSanitizer(m)
+    return m  # hotfix is class-level, so new instances are already patched
 
 def objective(trial: optuna.Trial) -> float:
-    r           = trial.suggest_categorical("r", [16, 32, 64])
-    alpha       = trial.suggest_categorical("alpha", [16, 32, 64])
+    # >>> includes 128 for r and alpha <<<
+    r           = trial.suggest_categorical("r", [16, 32, 64, 128])
+    alpha       = trial.suggest_categorical("alpha", [16, 32, 64, 128])
     dropout     = trial.suggest_float("dropout", 0.01, 0.15, step=0.02)
     use_rslora  = trial.suggest_categorical("use_rslora", [True, False])
-    target_mods = trial.suggest_categorical("target_modules", [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]])
+    target_mods = trial.suggest_categorical("target_modules",
+                                            [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]])
 
     temp_model = _fresh_base()
     try:
@@ -261,7 +259,6 @@ def objective(trial: optuna.Trial) -> float:
         fp16=torch.cuda.is_available(),
         report_to=["none"],
         dataloader_num_workers=0,
-        # (we intentionally do NOT change your other defaults)
     )
 
     trial_trainer = Seq2SeqTrainer(
@@ -302,10 +299,8 @@ with open("./optuna_results/best_lora_params.json", "w") as f:
 
 # Attach BEST LoRA to YOUR current model
 model = prepare_model_for_kbit_training(model)
-# model is already wrapped by sanitizer; keep it wrapped:
-base = model.base if isinstance(model, ForwardKwargSanitizer) else model
-base.gradient_checkpointing_enable()
-base.enable_input_require_grads()
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
 
 best = study.best_trial.params
 try:
@@ -321,10 +316,9 @@ except TypeError:
         task_type=TaskType.SEQ_2_SEQ_LM,
     )
 
-# Replace the base inside the wrapper with the LoRA-wrapped base
-base = get_peft_model(base, best_cfg)
-model = ForwardKwargSanitizer(base)
-model.base.print_trainable_parameters()
+from peft import get_peft_model
+model = get_peft_model(model, best_cfg)
+model.print_trainable_parameters()
 
 # =========================================================
 # Training args (ORIGINAL)
