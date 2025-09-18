@@ -1,32 +1,180 @@
-# ============================================
-# Optuna search to find best LoRA settings
-# (keeps your original code unchanged)
-# ============================================
-import gc, os, json, math
-import optuna
+# =========================================================
+# Imports (original)
+# =========================================================
+from datasets import Dataset, Audio, concatenate_datasets
+import glob
+import librosa
+import os
+import numpy as np
 
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType,
+# =========================================================
+# Convert G.711 audio to PCM (original)
+# =========================================================
+def convert_g711_to_pcm(pathname):
+    collection = []
+    with open(pathname, 'rb') as f:
+        while (inter := f.read(1)):
+            inter = int(ord(inter))
+            if inter == 127:
+                collection.append(-1)
+                continue
+            inter = ~inter
+            sign = inter & 0x80
+            exponent = (inter & 0x70) >> 4
+            data = inter & 0x0f
+            data |= 0x10
+            data <<= 1
+            data += 1
+            data <<= exponent + 2
+            data -= 0x84
+            data = data if sign == 0 else -data
+            collection.append(data)
+
+    collection = np.array(collection, dtype=np.float32) / 32768
+    collection = librosa.resample(collection, orig_sr=8_000, target_sr=16_000, scale=False)
+    return collection
+
+# =========================================================
+# Collect audio files + transcript cleaner (original)
+# =========================================================
+audio_files = glob.glob("origAudio/*.mp3")
+
+def retrieve_transcript(input_str: str) -> str:
+    tmp = input_str[input_str.find("-")+1:-4]  # strip track number + suffix
+    tmp = tmp.replace("_", " ")
+    tmp = tmp.replace(".", " ")
+    tmp = tmp.replace("shell", "she'll")
+    tmp = tmp.replace("dont", "don't")
+    tmp = tmp.capitalize()
+    tmp = tmp.replace("i ", "I ")
+    return tmp
+
+transcripts = [retrieve_transcript(s) for s in audio_files]
+num_samples = len(audio_files)
+
+raw_datasets = Dataset.from_dict({
+    "audio": audio_files[:num_samples],
+    "sentence": transcripts[:num_samples]
+}).cast_column("audio", Audio(sampling_rate=16_000))
+
+raw_datasets = raw_datasets.train_test_split(test_size=0.15, seed=91)
+
+# =========================================================
+# Processor (original)
+# =========================================================
+from transformers import WhisperProcessor
+whisper_loc = "/appdata/cortex/dev4/shobha/ASR/whisper_copy/distil-large-v2"
+processor = WhisperProcessor.from_pretrained(whisper_loc, language="English", task="transcribe")
+
+# =========================================================
+# Prepare dataset (original)
+# =========================================================
+def prepare_dataset(batch):
+    # load / resample / convert g711->pcm (original flow)
+    audio = batch["audio"]
+    prefix = "/appdata/cortex/dev4/asr_finetuning/audio_for_finetuning_low_qual"
+    audio["path"] = os.path.join(prefix, os.path.basename(audio["path"])).replace("mp3", "raw")
+    audio["array"] = convert_g711_to_pcm(audio["path"])
+
+    # features
+    batch["input_features"] = processor.feature_extractor(
+        audio["array"], sampling_rate=audio["sampling_rate"]
+    ).input_features[0]
+
+    # labels
+    transcription = batch["sentence"]
+    batch["labels"] = processor.tokenizer(transcription).input_ids
+    return batch
+
+vectorized_datasets = raw_datasets.map(
+    prepare_dataset,
+    remove_columns=raw_datasets.column_names["train"],
+    num_proc=1
 )
 
-# --- tiny, fast slices for the search (so it doesn't take forever)
+# =========================================================
+# Model (original)
+# =========================================================
+from transformers import WhisperForConditionalGeneration
+model = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
+
+model.config.suppress_tokens = []
+model.config.use_cache = False
+model.config.language = "english"
+model.config.task = "transcribe"
+
+# =========================================================
+# Data collator (original)
+# =========================================================
+import torch
+from dataclasses import dataclass
+from typing import Any, Dict, List, Union
+
+@dataclass
+class DataCollatorSpeechSeq2SeqWithPadding:
+    processor: Any
+    decoder_start_token_id: int
+
+    def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
+        input_features = [{"input_features": f["input_features"]} for f in features]
+        label_features = [{"input_ids": f["labels"]} for f in features]
+
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
+
+        # ignore pad in loss
+        labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
+
+        # drop BOS if already prepended
+        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+            labels = labels[:, 1:]
+
+        batch["labels"] = labels
+        return batch
+
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(
+    processor=processor,
+    decoder_start_token_id=model.config.decoder_start_token_id,
+)
+
+# =========================================================
+# Metrics (original)
+# =========================================================
+import evaluate
+metric = evaluate.load("wer")
+
+def compute_metrics(pred):
+    pred_ids = pred.predictions
+    label_ids = pred.label_ids
+    label_ids[label_ids == -100] = processor.tokenizer.pad_token_id
+
+    pred_str = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+
+    wer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"wer": wer}  # Trainer will expose as "eval_wer" during eval
+
+# =========================================================
+# (NEW) >>>>>>>>>>>>>>>>>>>>>>>  OPTUNA + LoRA BLOCK  <<<<<<<<<<<<<<<<<<<<<<<<<
+# Runs a quick hyperparam search and then attaches best LoRA to *your* model.
+# Placement: after model/processor/datasets/collator/metrics defined, before Trainer().
+# =========================================================
+import gc, json, math
+import optuna
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training, TaskType
+from transformers import Seq2SeqTrainer, Seq2SeqTrainingArguments
+
+# small, fast slices for search
 TUNE_TRAIN_SAMPLES = min(200, len(vectorized_datasets["train"]))
 TUNE_EVAL_SAMPLES  = min(100, len(vectorized_datasets["test"]))
 tune_train = vectorized_datasets["train"].select(range(TUNE_TRAIN_SAMPLES))
 tune_eval  = vectorized_datasets["test"].select(range(TUNE_EVAL_SAMPLES))
 
-# If you want to reload a fresh base model for each trial (recommended),
-# define this using the same 'whisper_loc' you already use:
 def _fresh_base():
     m = WhisperForConditionalGeneration.from_pretrained(whisper_loc)
-    # Safe even if you aren't using 8-bit; keeps norms in fp32, etc.
-    m = prepare_model_for_kbit_training(m)
+    m = prepare_model_for_kbit_training(m)  # safe even if not using 8-bit
     m.gradient_checkpointing_enable()
     m.enable_input_require_grads()
-    # keep your same config flags:
     m.config.suppress_tokens = []
     m.config.use_cache = False
     m.config.language = "english"
@@ -34,19 +182,16 @@ def _fresh_base():
     return m
 
 def objective(trial: optuna.Trial) -> float:
-    # --- search space (adjust/expand as you like)
+    # search space
     r           = trial.suggest_categorical("r", [16, 32, 64])
     alpha       = trial.suggest_categorical("alpha", [16, 32, 64])
     dropout     = trial.suggest_float("dropout", 0.01, 0.15, step=0.02)
     use_rslora  = trial.suggest_categorical("use_rslora", [True, False])
-    target_mods = trial.suggest_categorical(
-        "target_modules",
-        [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]]
-    )
+    target_mods = trial.suggest_categorical("target_modules", [["q_proj","v_proj"], ["q_proj","k_proj","v_proj"]])
 
     temp_model = _fresh_base()
 
-    # Build LoRA config (RS-LoRA if your PEFT supports it)
+    # build LoRA config, RS-LoRA if supported
     try:
         lcfg = LoraConfig(
             r=r,
@@ -58,7 +203,6 @@ def objective(trial: optuna.Trial) -> float:
             use_rslora=use_rslora,
         )
     except TypeError:
-        # Older PEFT fallback (no RS-LoRA flag)
         lcfg = LoraConfig(
             r=r,
             lora_alpha=alpha,
@@ -70,8 +214,7 @@ def objective(trial: optuna.Trial) -> float:
 
     temp_model = get_peft_model(temp_model, lcfg)
 
-    # Short, comparable run so Optuna can rank trials
-    trial_args = Seq2SeqTrainingArguments(
+    args = Seq2SeqTrainingArguments(
         output_dir=f"./optuna_trial_{trial.number}",
         per_device_train_batch_size=2,
         per_device_eval_batch_size=2,
@@ -85,26 +228,26 @@ def objective(trial: optuna.Trial) -> float:
         generation_max_length=225,
         fp16=torch.cuda.is_available(),
         report_to=["none"],
-        dataloader_num_workers=0,  # avoid multiprocessing overhead for tiny runs
+        dataloader_num_workers=0,
     )
 
-    trial_trainer = Seq2SeqTrainer(
+    t = Seq2SeqTrainer(
         model=temp_model,
-        args=trial_args,
+        args=args,
         train_dataset=tune_train,
         eval_dataset=tune_eval,
         data_collator=data_collator,
         tokenizer=processor,
-        compute_metrics=compute_metrics,  # your WER
+        compute_metrics=compute_metrics,
     )
 
-    trial_trainer.train()
-    metrics = trial_trainer.evaluate()
-    # Your compute_metrics returns {"wer": …}; Trainer wraps it as "eval_wer"
-    wer = float(metrics.get("eval_wer", math.inf))
+    t.train()
+    metrics = t.evaluate()
+    # prefer "eval_wer" if Trainer prefixes; otherwise fall back to "wer"
+    wer = float(metrics.get("eval_wer", metrics.get("wer", math.inf)))
 
-    # Cleanup GPU/CPU between trials
-    del trial_trainer, temp_model
+    # cleanup
+    del t, temp_model
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -114,7 +257,6 @@ def objective(trial: optuna.Trial) -> float:
         raise optuna.TrialPruned()
     return wer
 
-# Create and run the study
 study = optuna.create_study(
     direction="minimize",
     sampler=optuna.samplers.TPESampler(n_startup_trials=4, multivariate=True),
@@ -130,11 +272,7 @@ os.makedirs("./optuna_results", exist_ok=True)
 with open("./optuna_results/best_lora_params.json", "w") as f:
     json.dump(study.best_trial.params, f, indent=2)
 
-# ------------------------------------------------------------
-# Apply BEST LoRA to YOUR existing `model` for the real training
-# (No other parts of your script are changed)
-# ------------------------------------------------------------
-# Ensure prep (idempotent/safe to call again)
+# attach BEST LoRA to your in-memory model for real training
 model = prepare_model_for_kbit_training(model)
 model.gradient_checkpointing_enable()
 model.enable_input_require_grads()
@@ -161,7 +299,61 @@ except TypeError:
     )
 
 model = get_peft_model(model, best_cfg)
-model.print_trainable_parameters()  # sanity check: only LoRA params trainable
-# ============================================
-# End Optuna block — continue to your Trainer()
-# ============================================
+model.print_trainable_parameters()
+# =====================  END OPTUNA BLOCK  =====================================
+
+# =========================================================
+# Training args (original)
+# =========================================================
+from transformers import Seq2SeqTrainingArguments, TrainerCallback, pipeline
+
+training_args = Seq2SeqTrainingArguments(
+    output_dir="./V1",
+    per_device_train_batch_size=4,
+    gradient_accumulation_steps=8,
+    learning_rate=1e-5,
+    warmup_steps=500,
+    max_steps=1000,
+    gradient_checkpointing=True,
+    fp16=True,
+    evaluation_strategy="steps",
+    per_device_eval_batch_size=4,
+    predict_with_generate=True,
+    generation_max_length=225,
+    seed=91,
+    data_seed=91,
+    logging_steps=5,
+    eval_steps=5,
+    save_strategy="steps",
+    save_steps=5,
+    save_total_limit=2,
+    report_to=["none"],
+    load_best_model_at_end=True,
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    dataloader_num_workers=8,
+    dataloader_prefetch_factor=2,
+)
+
+# =========================================================
+# Trainer + Train (original)
+# =========================================================
+from transformers import Seq2SeqTrainer
+
+trainer = Seq2SeqTrainer(
+    args=training_args,
+    model=model,
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
+    data_collator=data_collator,
+    tokenizer=processor,
+    compute_metrics=compute_metrics,
+    # callbacks=[CustomCallback()],  # you had this commented; keep as-is
+)
+
+trainer.train()
+
+# =========================================================
+# Save (original)
+# =========================================================
+trainer.save_model("finetuned_model_v1")
