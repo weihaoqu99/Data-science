@@ -1,3 +1,31 @@
+from transformers import GenerationConfig
+import os
+from pathlib import Path
+
+MODEL_DIR = "finetuned_model_OL1"  # your folder
+
+# Fixed generation config
+gen_cfg = GenerationConfig(
+    max_length=225,
+    num_beams=1,        # greedy decoding
+    do_sample=False,
+    temperature=1.0,
+    top_p=1.0,
+    top_k=50,
+    length_penalty=1.0,
+    # ❌ removed early_stopping=True (only valid with beam search)
+    task="transcribe",
+    language="english"
+)
+
+# Save into your model folder
+Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+gen_cfg.save_pretrained(MODEL_DIR)
+
+print(f"✅ generation_config.json saved to {os.path.join(MODEL_DIR, 'generation_config.json')}")
+
+
+
 # ========= Create generation_config.json (and optionally merge LoRA) =========
 import os, json
 from pathlib import Path
