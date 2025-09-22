@@ -1,3 +1,144 @@
+# ========= Save full Whisper-style generation_config.json (and optionally merge LoRA) =========
+import os, json
+from pathlib import Path
+
+from transformers import WhisperForConditionalGeneration, WhisperProcessor, GenerationConfig
+
+# --- set these ---
+MODEL_DIR  = "finetuned_model_OL1"         # your saved folder (full model OR adapter)
+DO_MERGE   = False                         # set True to also create a merged full model folder
+BASE_MODEL = "openai/whisper-large-v2"     # base model to use if MODEL_DIR is adapter-only (or leave None to auto-read from adapter_config.json)
+
+Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+
+def load_full_model_from_dir(dir_path: str):
+    """Try to load a full Whisper model from a directory."""
+    return WhisperForConditionalGeneration.from_pretrained(dir_path)
+
+def ensure_processor(dir_path: str, base_or_loaded: str):
+    """Make sure tokenizer/processor files exist."""
+    try:
+        proc = WhisperProcessor.from_pretrained(dir_path if base_or_loaded is None else base_or_loaded)
+        proc.save_pretrained(dir_path)
+    except Exception as e:
+        print(f"ℹ️ Could not write processor files: {e}")
+
+def save_full_generation_config(model, out_dir: str):
+    """Save the *full* Whisper generation_config.json (includes lang_to_id, suppress_tokens, etc.)."""
+    # If you want to enforce your preferred defaults, set them before saving:
+    # (Uncomment if you want: these won't remove the big token lists.)
+    # model.generation_config.max_length = 225
+    # model.generation_config.num_beams  = 1
+    # model.generation_config.do_sample  = False
+    # model.generation_config.task       = "transcribe"
+    # model.generation_config.language   = "english"
+
+    model.generation_config.save_pretrained(out_dir)
+    print(f"✅ generation_config.json saved to: {os.path.join(out_dir, 'generation_config.json')}")
+
+def maybe_merge_adapter(adapter_dir: str, base_model_hint: str = None):
+    """If adapter folder, optionally merge into a standalone full model and return merged dir."""
+    from peft import PeftModel
+
+    # Find base from adapter_config.json if available
+    base_from_cfg = None
+    acfg = Path(adapter_dir) / "adapter_config.json"
+    if acfg.exists():
+        with open(acfg, "r") as f:
+            try:
+                base_from_cfg = json.load(f).get("base_model_name_or_path")
+            except Exception:
+                pass
+
+    base_to_use = base_from_cfg or base_model_hint
+    if base_to_use is None:
+        raise ValueError("Base model not provided and not found in adapter_config.json.")
+
+    print(f"ℹ️ Loading base model: {base_to_use}")
+    base_model = WhisperForConditionalGeneration.from_pretrained(base_to_use)
+
+    print(f"ℹ️ Loading adapter from: {adapter_dir}")
+    peft_model = PeftModel.from_pretrained(base_model, adapter_dir)
+
+    print("ℹ️ Merging LoRA adapter into base weights...")
+    merged = peft_model.merge_and_unload()
+
+    merged_dir = f"{adapter_dir}_merged"
+    Path(merged_dir).mkdir(parents=True, exist_ok=True)
+    merged.save_pretrained(merged_dir)
+    print(f"✅ Merged full model saved to: {merged_dir}")
+
+    # Save processor alongside merged model (nice to have)
+    try:
+        ensure_processor(merged_dir, base_to_use)
+    except Exception as e:
+        print(f"ℹ️ Could not save processor to merged dir: {e}")
+
+    return merged_dir
+
+# ----------------- main logic -----------------
+is_full_model = any(Path(MODEL_DIR).joinpath(x).exists() for x in ("pytorch_model.bin", "model.safetensors"))
+is_adapter    = Path(MODEL_DIR).joinpath("adapter_model.safetensors").exists()
+
+if is_full_model:
+    print("ℹ️ Detected FULL Whisper model folder.")
+    model = load_full_model_from_dir(MODEL_DIR)
+
+    # Ensure config.json exists (harmless if it already does)
+    model.config.save_pretrained(MODEL_DIR)
+    ensure_processor(MODEL_DIR, None)
+
+    # Save the full, verbose generation_config.json (with language maps & suppress lists)
+    save_full_generation_config(model, MODEL_DIR)
+
+elif is_adapter:
+    print("ℹ️ Detected LoRA ADAPTER folder.")
+    # You can still save a generation_config.json directly (it’s model-agnostic), but to get the
+    # exact Whisper-style one from a model instance, load base+adapter (or merge if requested).
+    if DO_MERGE:
+        merged_dir = maybe_merge_adapter(MODEL_DIR, BASE_MODEL)
+        # Load merged model and save full generation config there
+        merged_model = load_full_model_from_dir(merged_dir)
+        save_full_generation_config(merged_model, merged_dir)
+    else:
+        # Load base+adapter in memory only, then save generation_config to the adapter dir
+        from peft import PeftModel
+
+        # Choose base
+        base_to_use = BASE_MODEL
+        acfg = Path(MODEL_DIR) / "adapter_config.json"
+        if acfg.exists():
+            try:
+                base_to_use = json.load(open(acfg)).get("base_model_name_or_path") or base_to_use
+            except Exception:
+                pass
+        if base_to_use is None:
+            raise ValueError("Please set BASE_MODEL or include base_model_name_or_path in adapter_config.json.")
+
+        base_model = WhisperForConditionalGeneration.from_pretrained(base_to_use)
+        peft_model = PeftModel.from_pretrained(base_model, MODEL_DIR)
+        # Save full generation config (has the big Whisper fields) into the adapter dir
+        save_full_generation_config(peft_model, MODEL_DIR)
+        # Processor files (optional)
+        ensure_processor(MODEL_DIR, base_to_use)
+
+else:
+    raise FileNotFoundError(
+        f"'{MODEL_DIR}' does not look like a full model or a LoRA adapter folder.\n"
+        f"Expected one of: pytorch_model.bin/model.safetensors or adapter_model.safetensors"
+    )
+
+print("Done.")
+# =============================================================================================
+
+
+
+
+
+
+
+
+
 from transformers import GenerationConfig
 import os
 from pathlib import Path
