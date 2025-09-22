@@ -1,3 +1,98 @@
+# ========= Create generation_config.json (and optionally merge LoRA) =========
+import os, json
+from pathlib import Path
+
+MODEL_DIR = "finetuned_model_OL1"        # <-- your saved folder
+DO_MERGE  = False                        # set True if you also want to create a merged full model
+BASE_MODEL = "openai/whisper-large-v2"   # or your local base path (e.g., whisper_loc)
+
+# ---- 1) Always write generation_config.json for ASR defaults ----
+from transformers import GenerationConfig
+gen_cfg = GenerationConfig(
+    max_length=225,      # match your training generation_max_length
+    num_beams=1,         # greedy (typical for ASR)
+    do_sample=False,     # deterministic
+    temperature=1.0,
+    top_p=1.0,
+    top_k=50,
+    length_penalty=1.0,
+    early_stopping=True,
+    task="transcribe",   # Whisper-friendly defaults
+    language="english"
+)
+Path(MODEL_DIR).mkdir(parents=True, exist_ok=True)
+gen_cfg.save_pretrained(MODEL_DIR)
+print(f"✅ Wrote {os.path.join(MODEL_DIR, 'generation_config.json')}")
+
+# ---- 2) If MODEL_DIR already contains a full model, ensure config.json exists (optional) ----
+try:
+    has_full = any(Path(MODEL_DIR).joinpath(x).exists() for x in ["pytorch_model.bin", "model.safetensors"])
+    if has_full:
+        from transformers import WhisperForConditionalGeneration, WhisperProcessor
+        model = WhisperForConditionalGeneration.from_pretrained(MODEL_DIR)
+        # save/refresh config.json in place
+        model.config.save_pretrained(MODEL_DIR)
+        print(f"✅ Ensured config.json in {MODEL_DIR}")
+
+        # (nice-to-have) ensure processor/tokenizer files present
+        proc = WhisperProcessor.from_pretrained(MODEL_DIR)
+        proc.save_pretrained(MODEL_DIR)
+        print(f"✅ Ensured tokenizer/processor files in {MODEL_DIR}")
+except Exception as e:
+    print(f"ℹ️ Skipped config/processor refresh: {e}")
+
+# ---- 3) Adapter-only folder? (adapter_model.safetensors present) ----
+adapter_path = Path(MODEL_DIR).joinpath("adapter_model.safetensors")
+if adapter_path.exists():
+    print("ℹ️ Detected LoRA adapter folder.")
+    # Still fine: we already saved generation_config.json into MODEL_DIR above.
+    # Optionally: merge adapter into base → standalone full model folder.
+    if DO_MERGE:
+        try:
+            from transformers import WhisperForConditionalGeneration
+            from peft import PeftModel
+
+            # If adapter_config.json has base path, prefer that
+            adapter_cfg_file = Path(MODEL_DIR).joinpath("adapter_config.json")
+            base_from_adapter = None
+            if adapter_cfg_file.exists():
+                with open(adapter_cfg_file, "r") as f:
+                    acfg = json.load(f)
+                base_from_adapter = acfg.get("base_model_name_or_path")
+
+            base_to_use = base_from_adapter or BASE_MODEL
+            print(f"ℹ️ Merging adapter with base: {base_to_use}")
+
+            base_model = WhisperForConditionalGeneration.from_pretrained(base_to_use)
+            peft_model = PeftModel.from_pretrained(base_model, MODEL_DIR)
+            merged = peft_model.merge_and_unload()
+
+            MERGED_DIR = f"{MODEL_DIR}_merged"
+            Path(MERGED_DIR).mkdir(parents=True, exist_ok=True)
+            merged.save_pretrained(MERGED_DIR)
+            print(f"✅ Saved merged full model to {MERGED_DIR}")
+
+            # write generation_config.json into merged folder, too
+            gen_cfg.save_pretrained(MERGED_DIR)
+            print(f"✅ Wrote {os.path.join(MERGED_DIR, 'generation_config.json')}")
+
+            # (nice-to-have) save processor
+            try:
+                from transformers import WhisperProcessor
+                proc = WhisperProcessor.from_pretrained(base_to_use)
+                proc.save_pretrained(MERGED_DIR)
+                print(f"✅ Saved tokenizer/processor into {MERGED_DIR}")
+            except Exception as e:
+                print(f"ℹ️ Could not save processor into merged dir: {e}")
+
+        except Exception as e:
+            print(f"❗ Merge requested but failed: {e}")
+
+print("Done.")
+# ======================================================================
+
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
