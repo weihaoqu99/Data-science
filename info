@@ -1,3 +1,150 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Create generation_config.json for a fine-tuned Whisper model folder,
+optionally verify by running a quick transcription on an audio file.
+
+Usage:
+  python make_generation_config.py --model-dir finetuned_model_OL1 \
+      --max-length 225 --language english --task transcribe \
+      --num-beams 1 --do-sample false --test-audio example.wav
+"""
+
+import argparse
+import json
+import os
+import sys
+
+import torch
+from transformers import (
+    WhisperForConditionalGeneration,
+    WhisperProcessor,
+    GenerationConfig,
+)
+
+def str2bool(v: str) -> bool:
+    return str(v).lower() in {"1","true","t","yes","y"}
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Create generation_config.json for a fine-tuned Whisper model")
+    p.add_argument("--model-dir", required=True, help="Path to your fine-tuned model folder (e.g., finetuned_model_OL1)")
+    # Generation config defaults (match your training / common ASR settings)
+    p.add_argument("--max-length", type=int, default=225, help="Max generation length")
+    p.add_argument("--num-beams", type=int, default=1, help="Beam search beams (1 = greedy)")
+    p.add_argument("--do-sample", type=str, default="false", help="Use sampling (true/false). For ASR usually false.")
+    p.add_argument("--temperature", type=float, default=1.0, help="Sampling temperature")
+    p.add_argument("--top-p", type=float, default=1.0, help="Nucleus sampling p")
+    p.add_argument("--top-k", type=int, default=50, help="Top-k sampling")
+    p.add_argument("--length-penalty", type=float, default=1.0, help="Length penalty")
+    p.add_argument("--early-stopping", type=str, default="true", help="Early stopping (true/false)")
+    # Whisper-specific helpful defaults
+    p.add_argument("--task", type=str, default="transcribe", help="Whisper task: transcribe or translate")
+    p.add_argument("--language", type=str, default="english", help="Language string for Whisper decode")
+    # Optional quick test
+    p.add_argument("--test-audio", type=str, default=None, help="Optional path to a 16k WAV/MP3/FLAC for a quick transcription test")
+    return p.parse_args()
+
+def ensure_config(model_dir: str, model):
+    """
+    Ensure config.json exists. If not, save it.
+    """
+    cfg_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        model.config.save_pretrained(model_dir)
+        print(f"Created missing config.json at: {cfg_path}")
+
+def ensure_processor(model_dir: str, processor):
+    """
+    Ensure processor/tokenizer files exist (nice to have).
+    """
+    needed = ["tokenizer.json", "tokenizer_config.json", "preprocessor_config.json", "special_tokens_map.json"]
+    missing = [f for f in needed if not os.path.exists(os.path.join(model_dir, f))]
+    if missing:
+        processor.save_pretrained(model_dir)
+        print(f"Saved processor files into {model_dir} (were missing: {missing})")
+
+def write_generation_config(model_dir: str, args):
+    gen_cfg = GenerationConfig(
+        max_length=args.max_length,
+        num_beams=args.num_beams,
+        do_sample=str2bool(args.do_sample),
+        temperature=args.temperature,
+        top_p=args.top_p,
+        top_k=args.top_k,
+        length_penalty=args.length_penalty,
+        early_stopping=str2bool(args.early_stopping),
+        # Whisper-friendly extras:
+        task=args.task,
+        language=args.language,
+    )
+    gen_cfg.save_pretrained(model_dir)
+    print(f"✅ generation_config.json written to: {model_dir}")
+
+def quick_transcribe(model_dir: str, audio_path: str):
+    """
+    Optional quick transcription to verify everything works and defaults are picked up.
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        print("Skip test: audio not provided or not found.")
+        return
+
+    import librosa
+    # Load model & processor
+    model = WhisperForConditionalGeneration.from_pretrained(model_dir)
+    processor = WhisperProcessor.from_pretrained(model_dir)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+
+    speech, sr = librosa.load(audio_path, sr=16000)
+    inputs = processor.feature_extractor(speech, sampling_rate=16000, return_tensors="pt").input_features.to(device)
+
+    # generate() will automatically pick up generation_config.json now
+    with torch.no_grad():
+        pred_ids = model.generate(inputs)
+
+    text = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)[0]
+    print("\n=== Quick transcription test ===")
+    print(f"Audio: {audio_path}")
+    print(f"Text : {text}\n")
+
+def main():
+    args = parse_args()
+    model_dir = args.model_dir
+
+    if not os.path.isdir(model_dir):
+        print(f"ERROR: Model directory not found: {model_dir}")
+        sys.exit(1)
+
+    # Load model & processor (works even if config.json is already present/missing)
+    model = WhisperForConditionalGeneration.from_pretrained(model_dir)
+    processor = WhisperProcessor.from_pretrained(model_dir)
+
+    # Ensure config.json & processor files exist (harmless if they already do)
+    ensure_config(model_dir, model)
+    ensure_processor(model_dir, processor)
+
+    # Write generation_config.json
+    write_generation_config(model_dir, args)
+
+    # Optional quick test
+    if args.test_audio:
+        quick_transcribe(model_dir, args.test_audio)
+
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+
+
 m
 
 from transformers import WhisperForConditionalGeneration
