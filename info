@@ -10,6 +10,33 @@ model.config.save_pretrained("finetuned_model_OL1")
 print("✅ config.json created in finetuned_model_OL1/")
 
 
+from transformers import GenerationConfig
+
+# Build generation config based on your training args
+gen_config = GenerationConfig(
+    max_length=225,       # you used generation_max_length=225
+    num_beams=1,          # greedy decoding
+    do_sample=False,      # deterministic
+    temperature=1.0,
+    top_p=1.0,
+    top_k=50,
+    length_penalty=1.0,
+    early_stopping=True,
+
+    # Whisper-specific defaults (helpful for reloading later)
+    task="transcribe",
+    language="english"
+)
+
+# Save into your fine-tuned model folder
+gen_config.save_pretrained("finetuned_model_OL1")
+
+print("✅ generation_config.json created in finetuned_model_OL1/")
+
+
+
+
+
 
 1. Integrate the Metrics in Web App
 
