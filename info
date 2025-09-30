@@ -1,3 +1,35 @@
+import os
+
+RAW_DIR = "/appdata/cortex/dev4/asr_finetuning/audio_for_finetuning_low_qual"  # make sure this is correct
+
+def prepare_dataset(batch):
+    audio = batch["audio"]  # {"path","array","sampling_rate"}
+    orig_path = audio["path"]
+    sr = audio["sampling_rate"]
+
+    # default: use decoded waveform from HF Datasets (for mp3/wav)
+    waveform = audio["array"]
+
+    # Case 1: original file itself is .raw -> convert it
+    if orig_path.lower().endswith(".raw") and os.path.exists(orig_path):
+        waveform = convert_g711_to_pcm(orig_path)
+        sr = 16000
+
+    else:
+        # Case 2 (optional): if you keep parallel .raw files, prefer it IF it exists
+        base = os.path.splitext(os.path.basename(orig_path))[0] + ".raw"  # safe: handles names like "toomany..mp3"
+        raw_candidate = os.path.join(RAW_DIR, base)
+        if os.path.exists(raw_candidate):
+            waveform = convert_g711_to_pcm(raw_candidate)
+            sr = 16000
+
+    # features + labels
+    batch["input_features"] = processor.feature_extractor(waveform, sampling_rate=sr).input_features[0]
+    batch["labels"] = processor.tokenizer(batch["sentence"]).input_ids
+    return batch
+
+
+
 # ========= Save full Whisper-style generation_config.json (and optionally merge LoRA) =========
 import os, json
 from pathlib import Path
