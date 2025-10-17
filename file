@@ -1,3 +1,13 @@
+Yesterday, after the refinement call, I connected with Jay and we discussed three key points.
+
+For the first two points — multi-intent versus single-intent and the BERT Score — Jay will be connecting with the MRM team to gather additional details.
+
+For the sensitivity analysis, I’ve started running experiments with different parameter settings — specifically testing do_sample as True and False, max_length values of 200, 300, and 400, and repetition_penalty values of 1.1, 1.2, 1.5, and 1.8.
+
+Right now, I’m running these tests on the first 100 records from the July dataset and evaluating the results using BERT Score metrics. Once the comparison is complete, I’ll review the impact and share the findings.”
+
+
+
 Technical Report
 
 Project: Spanish-to-English Neural Machine Translation – LoRA Fine-Tuning, Evaluation, and Deployment
