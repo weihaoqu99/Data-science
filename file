@@ -1,3 +1,34 @@
+# July production data with 200 valid random samples
+import random
+
+# Filter out any rows that have missing 'Cumulative Transcript'
+valid_samples = July_samples[July_samples['Cumulative Transcript'].notna()].copy()
+
+# Randomly sample exactly 200 valid entries (or fewer if not enough valid rows exist)
+July_samples_200 = valid_samples.sample(n=min(200, len(valid_samples)), random_state=42)
+
+print(f"Selected {len(July_samples_200)} valid samples for generation...")
+
+# Run the inference process
+result = process_dataset_parallel(
+    July_samples_200,
+    'Cumulative Transcript',
+    configs,
+    model='CPS',
+    max_workers=35
+)
+
+# Save results
+result.to_csv('July_all_exp200.csv', index=False)
+print("✅ Saved predictions for 200 valid random samples.")
+
+
+
+
+
+
+
+
 Yesterday, after the refinement call, I connected with Jay and we discussed three key points.
 
 For the first two points — multi-intent versus single-intent and the BERT Score — Jay will be connecting with the MRM team to gather additional details.
