@@ -1,3 +1,13 @@
+As indicated in TS28, some transcripts in the production data contain multiple topics or intents, making it difficult for the model to generate a single, clear summary. To address this, we plan to introduce a simple annotation process provided by the business team. For each transcript, we will capture two basic indicators:
+	1.	Input Intents: Does the sample have multiple topics or intents in the input? (Yes/No)
+	2.	Output Intents: Does the model’s summary contain multiple topics or intents? (Yes/No)
+
+These simple flags will help track how often multiple intents occur and ensure that the model’s summaries accurately represent the main topic. The results will be reviewed regularly as part of ongoing model monitoring and improvement.
+
+
+
+
+
 As indicated in TS28, there are transcripts with multiple intents in the production data, and the model is not always able to create a single-intent summary with the most relevant intent. To address this, we proposed the following enhancements as part of the ongoing monitoring plan: (1) capturing the existence of multi-intents (Yes/No) by labeling each transcript with a binary LOB indicator to identify whether multiple intents are present or only a single intent exists. This helps in tracking the frequency and distribution of multi-intent cases and ensures the model’s predictions capture all relevant intents accurately, improving summarization quality and interpretability. (2) extracting and reviewing intent-bearing utterances from the call transcripts to verify that the model correctly associates each phrase or sentence with the corresponding intent. This step helps identify patterns where the model may miss or merge intents, allowing targeted improvements. (3) establishing ground-truth datasets that clearly mark all identified intents and primary intents for each transcript. These datasets will be validated using a random monthly sample of 100 production calls from each line of business. The results will be analyzed and included in the ongoing monitoring reports to ensure continuous validation, consistent tracking, and refinement of the model’s intent detection performance across CPS models.
 
 
