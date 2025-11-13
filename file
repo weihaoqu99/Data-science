@@ -1,3 +1,8 @@
+A transcript has multiple intents or topics when the speaker discusses more than one main purpose, task, or issue within the same call.
+These are clearly different from each other and are not part of the same flow.
+
+
+
 As indicated in TS28, some transcripts in the production data contain multiple topics or intents, making it difficult for the model to generate a single, clear summary. To address this, we plan to introduce a simple annotation process provided by the business team. For each transcript, we will capture two basic indicators:
 	1.	Input Intents: Does the sample have multiple topics or intents in the input? (Yes/No)
 	2.	Output Intents: Does the model’s summary contain multiple topics or intents? (Yes/No)
