@@ -1,3 +1,8 @@
+Out of 223 evaluated samples, we identified very few Contact Center – Other non-fluent summaries. Therefore, we combined four months of production data (3004 samples), passed them through the Transformer model (trained in November 2025), and focused on evaluating summaries with intents other than contact_center_other.
+
+From the 3004 evaluated samples, 143 were identified as not contact_center_other, and 20 were classified as non-fluent (13.9%). Among these 20 non-fluent summaries, 18 produced identical intent predictions when compared with their corrected/fluent summaries.
+
+
 They entered the telephone number themselves
 Remove the five-star rating from the Apple page
 Received $50 from my son yesterday at Cornell
