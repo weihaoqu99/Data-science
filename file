@@ -17,7 +17,12 @@ These metrics collectively determine whether annotators are rating summaries con
 
 Results:
 
-The comparison between the Old and New annotation methods shows measurable improvement across nearly all consistency metrics:
+The comparison between the Old and New annotation methods shows measurable improvement across nearly all consistency Overall, the results indicate greater inter-annotator agreement under the new annotation process, demonstrated by higher Cohen’s kappa scores and increased number of ties. The improvements directly address MRM’s concern regarding the inconsistency of human annotations and provide clear evidence that the updated guidelines and processes produce more reliable, stable annotation quality.
+
+
+
+Overall, the results indicate greater inter-annotator agreement under the new annotation process, demonstrated by higher Cohen’s kappa scores and increased number of ties. The improvements directly address MRM’s concern regarding the inconsistency of human annotations and provide clear evidence that the updated guidelines and processes produce more reliable, stable annotation quality.
+
 
 
 
