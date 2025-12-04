@@ -1,3 +1,27 @@
+To assess the root cause of low inter-annotator consistency and to evaluate whether the new annotation process improves agreement between annotators, the model development team conducted a detailed analysis using the same dataset annotated under both the old and the new annotation guidelines.
+
+The updated annotation process includes:
+	•	Removal of model-generated summaries from annotator view to ensure independence.
+	•	Refined definitions of Accuracy (0–5 scale) and Hallucination (0/1), with clearer examples.
+	•	Calibration sessions to align annotator interpretation across lines of business.
+
+Using these annotations, we evaluated agreement through standard statistical measures:
+	1.	Cohen’s Kappa (Hallucination): Measures degree of agreement beyond chance.
+	2.	Weighted Cohen’s Kappa (Accuracy): Quadratic weighting penalizes larger scoring differences.
+	3.	Accuracy Ties & Hallucination Ties: Count of instances where annotators assigned the exact same score.
+	4.	Average Difference & Sum Difference: Reflects how far apart annotators’ scores are when they disagree.
+
+These metrics collectively determine whether annotators are rating summaries consistently using the new process.
+
+⸻
+
+Results:
+
+The comparison between the Old and New annotation methods shows measurable improvement across nearly all consistency metrics:
+
+
+
+
 Response
 
 To address RAI04 regarding sensitivity testing of model inference parameters, the model development team conducted a comprehensive sensitivity analysis on the CPS Transformer model. A random sample of 500 transcripts was selected from four months of production data (May, June, July, and August) to ensure representation across multiple time periods and LOB distributions.
