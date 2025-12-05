@@ -1,3 +1,7 @@
+
+Hallucination Cohen’s kappa = Measures how consistently annotator 1 and annotator 2 classify hallucinations, accounting for agreement that could occur by chance.
+
+
 Accuracy Weighted Cohen’s kappa – quadratic weighting with accuracy for annotator 1 and 2. Quadratic weighting was chosen to penalize more harshly when values are wider apart, given the small scale of accuracy (0–5) and its ordinal nature. Linear works best on a continuous variable.
 
 
