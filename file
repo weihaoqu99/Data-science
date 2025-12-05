@@ -1,3 +1,7 @@
+Overall Annotator Performance Gap = Under the old process, the total average performance difference between annotator 1 and annotator 2 was about 6%, whereas with the new annotation guidelines the difference reduced to less than 1%, indicating significantly improved alignment.
+
+
+
 
 Hallucination Cohen’s kappa = Measures how consistently annotator 1 and annotator 2 classify hallucinations, accounting for agreement that could occur by chance.
 
