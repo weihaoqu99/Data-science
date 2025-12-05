@@ -1,3 +1,8 @@
+Accuracy Weighted Cohen’s kappa – quadratic weighting with accuracy for annotator 1 and 2. Quadratic weighting was chosen to penalize more harshly when values are wider apart, given the small scale of accuracy (0–5) and its ordinal nature. Linear works best on a continuous variable.
+
+
+
+
 To assess the root cause of low inter-annotator consistency and to evaluate whether the new annotation process improves agreement between annotators, the model development team conducted a detailed analysis using the same dataset annotated under both the old and the new annotation guidelines.
 
 The updated annotation process includes:
