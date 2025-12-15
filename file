@@ -1,3 +1,50 @@
+Rationale for Inference Configuration Choices
+
+Why do_sample = False Configurations Were Included (Deterministic Generation)
+
+The do_sample = False configurations represent deterministic inference behavior, where the model produces the same output for a given input under fixed parameters. These settings are commonly used in production environments that prioritize:
+	•	Output consistency and reproducibility
+	•	Reduced variance across repeated inferences
+	•	Stable behavior for compliance-sensitive applications
+
+By evaluating multiple num_beams and max_length values under deterministic decoding, the analysis assesses whether summary quality and semantic alignment remain stable as beam search depth and output length constraints vary. This ensures the model’s robustness under non-stochastic, controlled inference settings, which are frequently preferred for enterprise deployments.
+
+⸻
+
+Why do_sample = True Configurations Were Included (Stochastic Generation)
+
+The do_sample = True configurations represent sampling-based inference, which introduces controlled randomness into generation. These settings are relevant because:
+	•	They are widely used in exploratory and summarization tasks to improve linguistic diversity
+	•	Temperature, top-k, and top-p sampling directly influence creativity vs. faithfulness trade-offs
+	•	Real-world usage may involve sampling to avoid repetitive or overly generic summaries
+
+Evaluating sampling-based configurations allows the team to assess whether semantic fidelity, as measured by BERTScore, degrades or remains stable under stochastic decoding. This directly addresses inference-time sensitivity to randomness, which is a key concern highlighted in MRM guidance.
+
+⸻
+
+Rationale for Selection of Parameter Combinations
+
+The parameter grid was intentionally designed to balance coverage, realism, and computational feasibility:
+	•	Parameter ranges (e.g., temperature 0.1–1.0, top_p 0.5–0.9, num_beams 1–6) reflect industry-standard and production-realistic values
+	•	Extremes were avoided to exclude configurations that are known to produce degenerate or unusable outputs
+	•	Multiple interacting parameters were varied jointly to capture non-linear interactions between decoding controls
+	•	max_length was varied across short and long summaries to ensure robustness across different call durations and content densities
+
+This structured grid ensures broad coverage of the practical inference parameter space, rather than isolated or artificially constrained tests.
+
+⸻
+
+Conclusion
+
+The sensitivity analysis demonstrates that the CPS Transformer model exhibits robust and stable behavior across a wide range of inference-time configurations, including both deterministic and sampling-based decoding strategies.
+
+Across 876,000 generated summaries, BERTScore comparisons against ground truth references show that model performance remains consistent and resilient to reasonable variations in inference parameters. No material degradation or instability was observed that would indicate undue sensitivity to specific parameter choices.
+
+This comprehensive evaluation satisfies the intent of MRM Section 2.7.5 by validating inference-time robustness and provides strong evidence that the model’s production behavior is stable under both controlled and stochastic generation settings.
+
+
+
+
 Overall Annotator Performance Gap = Under the old process, the total average performance difference between annotator 1 and annotator 2 was about 6%, whereas with the new annotation guidelines the difference reduced to less than 1%, indicating significantly improved alignment.
 
 
