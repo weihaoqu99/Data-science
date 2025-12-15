@@ -1,3 +1,15 @@
+
+Based on the sensitivity testing conducted across 1,752 inference-time parameter configurations and 876,000 generated summaries, the CPS Transformer model demonstrates robust and stable performance with respect to inference parameter variations.
+
+Quantitative evaluation using BERTScore indicates that the current production (Original CPS) inference configuration consistently achieves equal or superior performance relative to all alternative deterministic and sampling-based configurations tested. No tested parameter combination resulted in a statistically or materially meaningful improvement over the production baseline.
+
+Deterministic decoding configurations (do_sample = False) exhibited lower variability and more stable BERTScore outcomes, while sampling-based configurations (do_sample = True) introduced increased variability and, in several cases, performance degradation relative to the baseline. Importantly, none of the sampled configurations exceeded the baseline BERTScore observed under the production parameters.
+
+These results confirm that the model’s outputs are not unduly sensitive to inference-time hyperparameter changes, satisfying the robustness expectations outlined in MRM Section 2.7.5. Accordingly, the existing production inference parameters are deemed appropriate, well-calibrated, and fit for continued use, with no identified need for parameter adjustment or remediation.
+
+
+
+
 Rationale for Inference Configuration Choices
 
 Why do_sample = False Configurations Were Included (Deterministic Generation)
