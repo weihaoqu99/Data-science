@@ -1,3 +1,8 @@
+Just a quick update: I have completed the planned reviews and shared the old and updated scripts, along with the MRM responses, with g, I also discussed the endpoint comparisons, and we agreed to keep the current setup unchanged since performance is similar across endpoints.
+
+I will be on CTA starting tomorrow and will be back on the 2nd. I will resume work once I return. If anything urgent comes up during this period, I am just a call away.
+
+
 
 Based on the sensitivity testing conducted across 1,752 inference-time parameter configurations and 876,000 generated summaries, the CPS Transformer model demonstrates robust and stable performance with respect to inference parameter variations.
 
