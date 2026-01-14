@@ -1,3 +1,32 @@
+What was the problem?
+
+Reviewers (MRM) raised two main concerns:
+	1.	Two production cases looked like the model broke its rules, specifically the rule that prevents repeating the same phrase.
+	2.	The model team had not previously tested whether changing inference settings would affect model quality, so MRM asked for sensitivity testing.
+
+⸻
+
+Part 1: Why the two “rule-breaking” cases were actually not errors
+
+At first glance, two summaries looked repetitive, for example:
+	•	“check and balance of check and balance”
+	•	“debit card number and old debit card number”
+
+Why this is not a real violation
+	•	The repetition rule works at the token level, not the word level.
+	•	The model splits text into tokens differently depending on position (start of sentence vs middle).
+	•	Even though the words look repeated to humans, the underlying tokens are different.
+
+Bottom line:
+The model did not violate its configuration. The apparent repetition is a tokenizer behavior, not a modeling issue.
+
+
+
+
+
+
+
+
 Just a quick update: I have completed the planned reviews and shared the old and updated scripts, along with the MRM responses, with g, I also discussed the endpoint comparisons, and we agreed to keep the current setup unchanged since performance is similar across endpoints.
 
 I will be on CTA starting tomorrow and will be back on the 2nd. I will resume work once I return. If anything urgent comes up during this period, I am just a call away.
