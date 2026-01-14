@@ -21,7 +21,83 @@ Bottom line:
 The model did not violate its configuration. The apparent repetition is a tokenizer behavior, not a modeling issue.
 
 
+Part 2: Why sensitivity testing was done
 
+Sensitivity testing answers a simple question:
+
+“If we slightly change how the model generates text, does the quality get better, worse, or stay the same?”
+
+This is important because:
+	•	It proves the model is stable and reliable
+	•	It shows the current setup is not fragile
+	•	It confirms the chosen settings are well-calibrated
+
+⸻
+
+Part 3: Two ways the model can generate text
+
+The model can generate summaries in two different modes:
+
+1. Deterministic Generation (do_sample = False)
+	•	The model always gives the same output for the same input
+	•	Used in production for CPS to ensure consistency and reproducibility
+
+2. Stochastic Generation (do_sample = True)
+	•	The model allows controlled randomness
+	•	Useful for creative tasks, but riskier for production summaries
+
+Both modes were tested to prove robustness.
+
+⸻
+
+Part 4: Deterministic generation — simple explanation
+
+What was tested?
+
+Two main things:
+	1.	How long the summary is allowed to be
+	2.	How many options the model explores before choosing the best one
+
+Summary length
+	•	Tested lengths from very short (30 tokens) to longer (400 tokens)
+	•	CPS summaries are usually one line, so longer limits don’t add value
+
+Number of beams
+	•	Beams are “parallel guesses” the model explores
+	•	More beams = slightly better quality but slower speed
+	•	Testing showed:
+	•	4 beams is already optimal
+	•	More beams give little or no improvement
+
+Result
+	•	Changing length or beams does not materially change summary quality
+	•	The current setting (4 beams, length 300) is already optimal
+	•	The model remains stable and consistent
+
+⸻
+
+Part 5: Stochastic generation — simple explanation
+
+This part checks:
+
+“If we allow randomness, does the model still behave sensibly?”
+
+What was tested?
+
+Several controls that influence randomness:
+	•	Temperature: how random the model is
+	•	Low = very predictable
+	•	High = more creative
+	•	Top-k: limits choices to the most likely words
+	•	Prevents strange or low-quality words
+	•	Top-p: limits choices to high-confidence probabilities
+	•	Keeps summaries focused
+	•	Repetition controls:
+	•	Prevents repeating phrases or sentences
+	•	Length limits:
+	•	Ensures summaries stay concise
+
+Thousands of combinations were tested.
 
 
 
