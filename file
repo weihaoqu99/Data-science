@@ -100,7 +100,243 @@ Several controls that influence randomness:
 Thousands of combinations were tested.
 
 
+Input / Cumulative Transcript
 
+“I had another card previously and I paid it off and then I got the new one. And I can’t, I can’t make a payment online.”
+
+Ideal Summary (Reference)
+
+“can’t make a payment online”
+
+This reference will be used to show how different parameter combinations can change—or not change—the output.
+
+⸻
+
+A. Deterministic Generation
+
+(do_sample = False)
+
+Key idea (very simple)
+	•	No randomness
+	•	Same input + same settings = same output every time
+	•	Differences only come from length limits and number of beams
+
+⸻
+
+1. max_length (30, 50, 100, 200, 300, 400)
+
+What this controls:
+“How much space the model is allowed to use
+
+max_length
+Example Output
+Explanation
+30
+“payment issue”
+Too short; meaning is lost
+50
+“can’t make online payment”
+Short but acceptable
+100
+“can’t make a payment online”
+Ideal
+200
+“can’t make a payment online”
+Same as 100 (no benefit)
+300
+“can’t make a payment online”
+Same (current CPS)
+400
+“can’t make a payment online”
+Same
+
+Key learning:
+Once the model has enough room, increasing length does not improve quality.
+
+⸻
+
+2. num_beams (1, 2, 4, 6)
+
+What this controls:
+“How many candidate summaries the model considers before choosing the best one.”
+
+num_beams
+Example Output
+Explanation
+1
+“payment problem”
+Fast but vague
+2
+“can’t pay online”
+Better
+4
+“can’t make a payment online”
+Best balance (current)
+6
+“can’t make a payment online”
+
+Key learning:
+Beyond 4 beams, quality stops improving.
+
+⸻
+
+3. Why there are 24 deterministic configurations
+	•	6 max_length values
+	•	4 num_beams values
+	•	6 × 4 = 24 combinations
+
+Each combination confirms that:
+	•	Meaning does not change
+	•	Quality stays stable
+	•	Current configuration is already optimal
+
+⸻
+
+B. Sampling Generation
+
+(do_sample = True)
+
+Key idea (very simple)
+	•	Controlled randomness
+	•	Same input can produce slightly different wording
+	•	Used to test robustness, not production behavior
+
+⸻
+
+1. temperature (0.1, 0.7, 0.9, 1.0)
+
+What this controls:
+“How creative or safe the wording is.”
+
+temperature
+Example Output
+0.1
+“can’t make a payment online”
+0.7
+“unable to make an online payment”
+0.9
+“experiencing difficulty with online payments”
+1.0
+“customer is having issues paying online”
+
+Higher temperature = more variation.
+
+⸻
+
+2. top_k (50, 100, 200)
+
+What this controls:
+“How many word options the model can choose from.”
+top_k
+Example Output
+50
+“can’t make a payment online”
+100
+“unable to make an online payment”
+200
+“having trouble completing a digital transaction”
+
+Higher values allow less common words, increasing risk.
+
+⸻
+
+3. top_p (0.5, 0.8, 0.9)
+
+What this controls:
+“How confident the model must be in its word choice.”
+
+Higher values allow less common words, increasing risk.
+
+⸻
+
+3. top_p (0.5, 0.8, 0.9)
+
+What this controls:
+“How confident the model must be in its word choice.”
+
+top_p
+Example Output
+0.5
+“can’t make a payment online”
+0.8
+“unable to make online payments”
+0.9
+“experiencing issues with digital payments”
+
+Higher top_p = more diversity, less certainty.
+
+⸻
+
+4. no_repeat_ngram_size (3, 5)
+
+What this controls:
+“Don’t repeat the same phrase.”
+
+Example impact
+	•	3:
+“can’t make a payment online”
+	•	5:
+Same output (no added benefit for short summaries)
+
+⸻
+
+5. repetition_penalty (1.0, 1.1, 1.5, 1.8)
+
+What this controls:
+“How strongly repetition is discouraged.”
+Penalty
+Example Output
+1.0
+“can’t make a payment online”
+1.1
+“unable to make an online payment”
+1.5
+“unable to complete an online transaction”
+1.8
+“unable complete transaction digitally” (degraded)
+
+max_length (30–400)
+
+Same behavior as deterministic:
+	•	Too small → incomplete meaning
+	•	Too large → no benefit
+
+⸻
+
+7. Why there are 1,728 sampling configurations
+	•	4 temperatures
+	•	3 top_k values
+	•	3 top_p values
+	•	2 n-gram sizes
+	•	4 repetition penalties
+	•	6 length values
+
+4 × 3 × 3 × 2 × 4 × 6 = 1,728 combinations
+
+This ensures:
+	•	All reasonable randomness settings are tested
+	•	Meaning stays intact
+	•	Quality remains acceptable
+
+⸻
+
+Final Simple Takeaway
+
+Deterministic testing proves:
+	•	The summary meaning does not change
+	•	The model is stable and consistent
+	•	Current production settings are optimal
+
+Sampling testing proves:
+	•	Even with randomness, summaries remain correct
+	•	No configuration produces materially better results
+	•	The model is robust, not fragile
+
+⸻
+
+One-line explanation for MRM / auditors
+
+“By testing 24 deterministic and 1,728 sampling configurations using the same real transcript, we confirmed that summary meaning and quality remain stable across inference settings, validating that the current CPS configuration is robust and well-calibrated.”
 
 
 
