@@ -1,4 +1,91 @@
-# =========================
+# Team #XX – Chat Pulse | Intelligent Banking Service BOT
+
+Resolving complex service issues in real time
+
+Meeting customers at their moment of friction
+
+⸻
+
+Problem Context
+
+Customers frequently reach out during high-stress financial events such as:
+	•	Unexpected deposit holds
+	•	Lost / stolen card incidents
+	•	Transaction disputes with urgent timelines
+
+These moments demand speed, accuracy, and personalization, yet are currently constrained by manual workflows.
+
+~65% of service escalations originate from unresolved deposit, card, or dispute inquiries within the first interaction
+Current Experience vs Proposed Solution
+
+Current Experience
+Proposed AI-Driven Solution
+Response Time
+Delayed responses (hours to days) due to agent triage and backlogs
+Near real-time acknowledgment and guided resolution via AI-orchestrated flows
+Deposit Holds
+Generic explanations; agents manually check policies and account context
+Context-aware explanations using customer profile, hold reason, amount, and release ETA
+Card Replacement
+Customer waits for agent; multiple authentication steps
+Instant card-replacement initiation with IVR deep-link and secure digital authentication
+Dispute Cases
+Manual intake, repeated questions, unclear status
+Automated dispute intake, eligibility check, evidence guidance, and real-time status updates
+Personalization
+One-size-fits-all scripts
+Personalized responses using customer history, transaction patterns, and prior summaries
+Leverage Bank Ecosystem
+Limited digital handoff
+Seamless integration with core banking, IVR, and case systems
+
+How the Solution Works (Executive-Level View)
+	1.	Customer initiates message (social / app / chat) during a deposit hold, card loss, or dispute.
+	2.	AI Prompt Rewriter dynamically enriches the request using:
+	•	Customer profile & KYC status
+	•	Recent transactions & holds
+	•	Conversation summaries
+	3.	Decision Engine identifies intent:
+	•	Deposit Hold → Explain, set expectations, offer next steps
+	•	Card Replacement → Authenticate → Order → Track
+	•	Dispute → Intake → Validate → Create case
+	4.	Simulated Response Layer (for Innovation Summit):
+	•	Pre-approved templates
+	•	Deterministic logic (no live RAG dependency)
+	5.	Human-ready escalation only if policy or risk thresholds are breached.
+
+⸻
+
+Business Impact
+
+Customer
+	•	Reduced anxiety during critical financial moments
+	•	Clear explanations, faster resolution, fewer handoffs
+
+Operations
+	•	Lower agent load for high-volume, repeat inquiries
+	•	Faster case creation and cleaner data capture
+
+Technology
+	•	No dependency on live RAG or enhancer instances
+	•	Safe, compliant, demo-ready architecture
+
+⸻
+
+Why This Matters Now
+
+This is the “ATM moment” for complex banking service conversations.
+Customers expect instant, intelligent resolution—especially when money is on hold, access is blocked, or disputes are time-sensitive.
+
+⸻
+
+
+
+
+
+
+
+=========================
 # YOUR ORIGINAL CODE (unchanged)
 # =========================
 import os
